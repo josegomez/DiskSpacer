@@ -62,10 +62,13 @@ fn run(req: &ScanRequest, progress: &Progress) -> ScanMsg {
     if req.prefer_mft
         && let Some(letter) = platform::drive_letter_root(&req.path)
     {
+        // change-journal position *before* reading the MFT, so nothing is missed
+        let usn = crate::live::query_letter(letter);
         match platform::open_volume(letter) {
             Ok(vol) => match mft::scan_mft(vol, progress) {
                 Ok((entries, ids, _g)) => {
                     let mut t = build_tree(entries, ids, mft::ROOT_RECORD, &format!("{letter}:\\"), ScanMethod::Mft);
+                    t.usn = usn.map(|(id, next)| (letter, id, next));
                     finish(&mut t, &req.path, t0);
                     return ScanMsg::Done(Box::new(t), None);
                 }

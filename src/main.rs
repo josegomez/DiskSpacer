@@ -7,6 +7,7 @@ mod compare;
 mod delete;
 mod dupes;
 mod filter;
+mod live;
 mod model;
 mod platform;
 mod remote;

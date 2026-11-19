@@ -126,8 +126,8 @@ fn layout_node(
     if total <= 0.0 {
         return;
     }
-    let kids: Vec<(u32, f64)> =
-        t.children(i).map(|c| (c, weight(t, c, p.use_alloc))).take_while(|&(_, w)| w > 0.0).collect();
+    let mut kids: Vec<(u32, f64)> = t.children(i).map(|c| (c, weight(t, c, p.use_alloc))).filter(|&(_, w)| w > 0.0).collect();
+    kids.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
     if kids.is_empty() {
         return;
     }

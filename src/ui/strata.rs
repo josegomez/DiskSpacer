@@ -47,9 +47,8 @@ fn kids(t: &Tree, st: &State, i: u32) -> Kids {
 
 fn kids_uncached(t: &Tree, i: u32, use_alloc: bool) -> Vec<(u32, u64)> {
     let mut v: Vec<(u32, u64)> = t.children(i).map(|c| (c, n_metric(t, c, use_alloc))).filter(|k| k.1 > 0).collect();
-    if !use_alloc {
-        v.sort_by(|a, b| b.1.cmp(&a.1));
-    }
+    // always sort: children added by live updates are appended unsorted
+    v.sort_by(|a, b| b.1.cmp(&a.1));
     v
 }
 

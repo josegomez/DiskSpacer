@@ -161,6 +161,11 @@ pub struct App {
     logo: egui::TextureHandle,
     mode: Mode,
     compare: compare::CompareState,
+    watcher: Option<crate::live::Watcher>,
+    logo_ctx: egui::Context,
+    live_on: bool,
+    live_count: usize,
+    pending_live: Option<(char, u64, i64)>,
     ssh_form: Option<SshForm>,
     scan_is_remote: bool,
     pending_remote_rescan: Option<(Arc<crate::remote::Conn>, PathBuf)>,
@@ -284,6 +289,11 @@ impl App {
             scanning: None,
             mode: Mode::Analyze,
             compare: compare::CompareState::default(),
+            watcher: None,
+            logo_ctx: ctx.clone(),
+            live_on: true,
+            live_count: 0,
+            pending_live: None,
             ssh_form: None,
             scan_is_remote: false,
             pending_remote_rescan: None,
@@ -326,10 +336,12 @@ impl App {
         self.scan_is_remote = false;
         self.st.viewing_saved = crate::snapshot::read_meta(&path).ok();
         self.scan_rx = Some(rx);
+        self.watcher = None;
     }
 
     fn start_request(&mut self, req: ScanRequest, ctx: &egui::Context) {
         self.st.viewing_saved = None;
+        self.watcher = None;
         self.progress = Arc::new(Progress::default());
         self.scan_started = Instant::now();
         let label = match (&req.remote, &req.conn) {
@@ -387,6 +399,11 @@ impl App {
                 if !st.search_text.is_empty() {
                     st.search_due = Some(Instant::now());
                 }
+                self.live_count = 0;
+                self.watcher = match (t.usn, self.live_on, &self.st.viewing_saved) {
+                    (Some((letter, id, usn)), true, None) => crate::live::start(letter, id, usn, self.logo_ctx.clone()),
+                    _ => None,
+                };
                 self.tree = Some(*t);
             }
             ScanMsg::Failed(e) => {
@@ -400,6 +417,43 @@ impl App {
                 self.st.notice = Some((e, DANGER));
             }
             ScanMsg::NeedTrust(target, fp, path) => self.trust_prompt = Some((target, fp, path)),
+        }
+    }
+
+    fn poll_live(&mut self) {
+        let Some(w) = &self.watcher else { return };
+        let events: Vec<crate::live::Event> = w.rx.try_iter().collect();
+        if events.is_empty() {
+            return;
+        }
+        let Some(t) = self.tree.as_mut() else { return };
+        let mut changed = 0;
+        for ev in events {
+            match ev {
+                crate::live::Event::Changes(ups) => changed += crate::live::apply(t, ups),
+                crate::live::Event::Lost(why) => {
+                    self.st.notice = Some((format!("Live updates stopped: {why}. Rescan to refresh."), WARN));
+                    self.watcher = None;
+                    break;
+                }
+            }
+        }
+        if changed > 0 {
+            self.live_count += changed;
+            if let Some((total, free)) = platform::disk_space(std::path::Path::new(t.name(t.root))) {
+                t.volume_total = total;
+                t.volume_free = free;
+            }
+            let st = &mut self.st;
+            st.generation += 1;
+            st.rows_dirty = true;
+            st.tm = None;
+            if st.selected.is_some_and(|s| t.node(s).is_deleted()) {
+                st.selected = None;
+            }
+            while t.node(st.view_root).is_deleted() || (st.view_root != t.root && t.node(st.view_root).parent == NONE) {
+                st.view_root = if t.node(st.view_root).parent == NONE { t.root } else { t.node(st.view_root).parent };
+            }
         }
     }
 
@@ -483,6 +537,7 @@ impl App {
         }
         self.poll_scan();
         self.poll_job();
+        self.poll_live();
         if self.scan_rx.is_some() || self.st.job.is_some() {
             ctx.request_repaint_after(Duration::from_millis(100));
         }
@@ -527,6 +582,9 @@ impl App {
         self.modals(&ctx);
 
         self.ssh_modals(&ctx);
+        if let Some((letter, id, usn)) = self.pending_live.take() {
+            self.watcher = crate::live::start(letter, id, usn, ctx.clone());
+        }
         if let Some((conn, path)) = self.pending_remote_rescan.take() {
             self.start_request(ScanRequest { path, prefer_mft: false, remote: None, conn: Some(conn) }, &ctx);
         }
@@ -561,7 +619,7 @@ impl App {
             ui.label(RichText::new("SizeMatters").size(18.0).strong().color(Color32::WHITE));
             ui.add_space(10.0);
             ui.selectable_value(&mut self.mode, Mode::Analyze, RichText::new("📊 Analyze").strong());
-            ui.selectable_value(&mut self.mode, Mode::Compare, RichText::new("⇄ Compare folders").strong());
+            ui.selectable_value(&mut self.mode, Mode::Compare, RichText::new("⇄ Compare").strong());
             ui.separator();
             if self.mode == Mode::Compare {
                 return;
@@ -569,7 +627,7 @@ impl App {
             let scanning = self.scan_rx.is_some();
             let drives = &self.st.drives;
             let cur = drives.get(self.st.drive_pick).map(drive_label).unwrap_or_else(|| "Select drive".into());
-            egui::ComboBox::from_id_salt("drive").selected_text(cur).width(210.0).show_ui(ui, |ui| {
+            egui::ComboBox::from_id_salt("drive").selected_text(cur).width(150.0).show_ui(ui, |ui| {
                 for (k, d) in drives.iter().enumerate() {
                     ui.selectable_value(&mut self.st.drive_pick, k, drive_label(d));
                 }
@@ -624,12 +682,20 @@ impl App {
                 ui.selectable_value(&mut st.view, View::Strata, "▤ Strata").on_hover_text("The disk as stacked bars: each row splits the folder above it");
                 ui.selectable_value(&mut st.view, View::Treemap, "▦ Treemap").on_hover_text("Dense cushion treemap");
                 ui.separator();
-                ui.selectable_value(&mut st.color_mode, ColorMode::Folder, "By folder").on_hover_text("Each top-level branch gets its own colour");
-                ui.selectable_value(&mut st.color_mode, ColorMode::Type, "By type").on_hover_text("Colour files by kind: videos, images, apps…");
-                ui.selectable_value(&mut st.color_mode, ColorMode::Age, "By age").on_hover_text("Colour by last modified: amber = recent, blue = old");
-                ui.separator();
-                ui.selectable_value(&mut st.use_alloc, true, "On disk").on_hover_text("Measure by allocated space (what you get back when deleting)");
-                ui.selectable_value(&mut st.use_alloc, false, "Size").on_hover_text("Measure by logical file size");
+                let cm_label = match st.color_mode {
+                    ColorMode::Folder => "🎨 By folder",
+                    ColorMode::Type => "🎨 By type",
+                    ColorMode::Age => "🎨 By age",
+                };
+                egui::ComboBox::from_id_salt("colour").selected_text(cm_label).width(110.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut st.color_mode, ColorMode::Folder, "By folder").on_hover_text("Each top-level branch gets its own colour");
+                    ui.selectable_value(&mut st.color_mode, ColorMode::Type, "By type").on_hover_text("Videos, images, apps… each get a colour");
+                    ui.selectable_value(&mut st.color_mode, ColorMode::Age, "By age").on_hover_text("Amber = recently modified, blue = old");
+                });
+                egui::ComboBox::from_id_salt("metric").selected_text(if st.use_alloc { "On disk" } else { "Size" }).width(80.0).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut st.use_alloc, true, "On disk").on_hover_text("Allocated space: what you get back when deleting");
+                    ui.selectable_value(&mut st.use_alloc, false, "Size").on_hover_text("Logical file size");
+                });
             }
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 if self.tree.is_some() {
@@ -637,7 +703,7 @@ impl App {
                     let r = ui.add(
                         egui::TextEdit::singleline(&mut st.search_text)
                             .hint_text("🔍 Search all files…   ext:iso size:>1gb older:1y")
-                            .desired_width(340.0),
+                            .desired_width(ui.available_width().clamp(160.0, 340.0)),
                     );
                     if st.focus_search {
                         r.request_focus();
@@ -676,6 +742,21 @@ impl App {
                 ui.label(format!("{} files · {} folders", fmt_count(r.files as u64), fmt_count(r.dirs as u64)));
                 ui.separator();
                 ui.label(format!("scanned in {:.2}s", t.scan_ms as f64 / 1000.0));
+                if t.usn.is_some() && self.st.viewing_saved.is_none() {
+                    ui.separator();
+                    let on = self.watcher.is_some();
+                    let txt = if on { RichText::new(format!("● Live{}", if self.live_count > 0 { format!(" · {} changes", fmt_count(self.live_count as u64)) } else { String::new() })).color(OK) } else { RichText::new("○ Live off").color(Color32::from_gray(140)) };
+                    if ui.add(egui::Button::new(txt).frame(false)).on_hover_text("Follows the NTFS change journal and updates the view as files change, without rescanning. Click to toggle.").clicked() {
+                        if on {
+                            self.watcher = None;
+                            self.live_on = false;
+                        } else if let Some((letter, id, usn)) = t.usn {
+                            // resume from the scan-time position: all changes since are replayed
+                            self.live_on = true;
+                            self.pending_live = Some((letter, id, usn));
+                        }
+                    }
+                }
             }
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
                 ui.toggle_value(&mut self.st.remote, "🖥 Remote mode").on_hover_text(

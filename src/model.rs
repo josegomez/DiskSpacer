@@ -115,6 +115,13 @@ pub struct Tree {
     pub sep: char,
     /// Set when the tree was scanned on a remote host over SSH.
     pub remote: Option<std::sync::Arc<crate::remote::Conn>>,
+    /// Scanner id (MFT record number) → node, for applying live changes.
+    pub id_map: Vec<u32>,
+    /// Children added or moved after the scan (the CSR array is immutable).
+    pub extra_children: HashMap<u32, Vec<u32>>,
+    pub ext_lookup: HashMap<String, u16>,
+    /// NTFS change-journal position at scan start: (drive letter, journal id, next USN).
+    pub usn: Option<(char, u64, i64)>,
 }
 
 impl Tree {
@@ -131,17 +138,23 @@ impl Tree {
 
     /// Live (not deleted) children, largest first.
     pub fn children(&self, i: u32) -> impl Iterator<Item = u32> + '_ {
-        let n = &self.nodes[i as usize];
-        self.children[n.child_start as usize..(n.child_start + n.child_count) as usize]
-            .iter()
-            .copied()
-            .filter(move |&c| !self.nodes[c as usize].is_deleted())
+        self.child_iter(i).filter(move |&c| !self.nodes[c as usize].is_deleted())
     }
 
-    /// All child slots, including deleted ones.
-    pub fn raw_children(&self, i: u32) -> &[u32] {
+    /// CSR children plus children added/moved later; skips nodes that moved elsewhere.
+    fn child_iter(&self, i: u32) -> impl Iterator<Item = u32> + '_ {
         let n = &self.nodes[i as usize];
-        &self.children[n.child_start as usize..(n.child_start + n.child_count) as usize]
+        let extra: &[u32] = if self.extra_children.is_empty() { &[] } else { self.extra_children.get(&i).map(|v| v.as_slice()).unwrap_or(&[]) };
+        self.children[n.child_start as usize..(n.child_start + n.child_count) as usize]
+            .iter()
+            .chain(extra.iter())
+            .copied()
+            .filter(move |&c| self.nodes[c as usize].parent == i)
+    }
+
+    /// All children, including deleted ones.
+    pub fn raw_children(&self, i: u32) -> Vec<u32> {
+        self.child_iter(i).collect()
     }
 
     pub fn has_children(&self, i: u32) -> bool {
@@ -228,7 +241,7 @@ impl Tree {
             e.count = e.count.saturating_sub(1);
         } else {
             // flag the whole subtree and subtract extension stats of all files below
-            let mut stack: Vec<u32> = self.raw_children(i).to_vec();
+            let mut stack: Vec<u32> = self.raw_children(i);
             while let Some(c) = stack.pop() {
                 if self.nodes[c as usize].is_deleted() {
                     continue;
@@ -236,7 +249,7 @@ impl Tree {
                 self.nodes[c as usize].flags |= flags::DELETED;
                 let n = &self.nodes[c as usize];
                 if n.is_dir() {
-                    stack.extend_from_slice(self.raw_children(c));
+                    stack.extend(self.raw_children(c));
                 } else {
                     let (s, a, x) = (n.size, n.alloc, n.ext as usize);
                     let e = &mut self.exts[x];
@@ -263,6 +276,159 @@ impl Tree {
         let parent = self.nodes[i as usize].parent;
         if parent != NONE {
             self.resort_upwards(parent);
+        }
+    }
+
+    // ---------------- live changes ----------------
+
+    fn adjust_ancestors(&mut self, from: u32, size: i64, alloc: i64, files: i64, dirs: i64) {
+        let mut p = from;
+        while p != NONE {
+            let n = &mut self.nodes[p as usize];
+            n.size = (n.size as i64 + size).max(0) as u64;
+            n.alloc = (n.alloc as i64 + alloc).max(0) as u64;
+            n.files = (n.files as i64 + files).max(0) as u32;
+            n.dirs = (n.dirs as i64 + dirs).max(0) as u32;
+            if p == self.root {
+                break;
+            }
+            p = n.parent;
+        }
+    }
+
+    fn ext_index(&mut self, name: &str, is_dir: bool) -> u16 {
+        let e = ext_of(name, is_dir);
+        if let Some(&x) = self.ext_lookup.get(&e) {
+            return x;
+        }
+        if self.exts.len() >= u16::MAX as usize {
+            return 0;
+        }
+        let x = self.exts.len() as u16;
+        self.exts.push(ExtStat { name: e.clone(), ..Default::default() });
+        self.ext_lookup.insert(e, x);
+        x
+    }
+
+    fn ext_add(&mut self, i: u32, sign: i64) {
+        let n = &self.nodes[i as usize];
+        if n.is_dir() {
+            return;
+        }
+        let (s, a, x) = (n.size as i64, n.alloc as i64, n.ext as usize);
+        let e = &mut self.exts[x];
+        e.size = (e.size as i64 + sign * s).max(0) as u64;
+        e.alloc = (e.alloc as i64 + sign * a).max(0) as u64;
+        e.count = (e.count as i64 + sign).max(0) as u64;
+    }
+
+    /// Add a new file/folder under `parent`; returns the new node.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_node(&mut self, parent: u32, name: &str, fl: u16, size: u64, alloc: u64, modified: i64, scan_id: Option<u32>) -> u32 {
+        let is_dir = fl & flags::DIR != 0;
+        let off = self.names.len() as u32;
+        let nm = &name[..floor_char_boundary(name, name.len().min(u16::MAX as usize))];
+        self.names.push_str(nm);
+        let ext = self.ext_index(nm, is_dir);
+        let i = self.nodes.len() as u32;
+        self.nodes.push(Node {
+            parent: NONE,
+            child_start: 0,
+            child_count: 0,
+            name_off: off,
+            name_len: nm.len() as u16,
+            flags: fl & !flags::DELETED,
+            ext,
+            size: if is_dir { 0 } else { size },
+            alloc: if is_dir { 0 } else { alloc },
+            files: if is_dir { 0 } else { 1 },
+            dirs: 0,
+            created: modified,
+            modified,
+            accessed: modified,
+        });
+        self.ext_add(i, 1);
+        if let Some(id) = scan_id {
+            let id = id as usize;
+            if id >= self.id_map.len() {
+                self.id_map.resize(id + 1, NONE);
+            }
+            self.id_map[id] = i;
+        }
+        self.attach(i, parent);
+        i
+    }
+
+    /// Hang a detached node (and its subtree) under `parent`, updating totals.
+    pub fn attach(&mut self, i: u32, parent: u32) {
+        let n = &self.nodes[i as usize];
+        let (s, a, f, d) = (n.size as i64, n.alloc as i64, n.files as i64, n.dirs as i64 + n.is_dir() as i64);
+        self.nodes[i as usize].parent = parent;
+        let p = &self.nodes[parent as usize];
+        let in_csr = self.children[p.child_start as usize..(p.child_start + p.child_count) as usize].contains(&i);
+        if !in_csr {
+            let v = self.extra_children.entry(parent).or_default();
+            if !v.contains(&i) {
+                v.push(i);
+            }
+        }
+        self.adjust_ancestors(parent, s, a, f, d);
+    }
+
+    /// Unhook a node (and its subtree) from its parent, updating totals.
+    pub fn detach(&mut self, i: u32) {
+        let n = &self.nodes[i as usize];
+        let parent = n.parent;
+        if parent == NONE || i == self.root {
+            return;
+        }
+        let (s, a, f, d) = (n.size as i64, n.alloc as i64, n.files as i64, n.dirs as i64 + n.is_dir() as i64);
+        self.adjust_ancestors(parent, -s, -a, -f, -d);
+        self.nodes[i as usize].parent = NONE;
+    }
+
+    pub fn move_node(&mut self, i: u32, new_parent: u32) {
+        if self.nodes[i as usize].parent == new_parent || self.is_ancestor(i, new_parent) {
+            return;
+        }
+        self.detach(i);
+        self.attach(i, new_parent);
+    }
+
+    pub fn rename(&mut self, i: u32, name: &str) {
+        if self.name(i) == name {
+            return;
+        }
+        self.ext_add(i, -1);
+        let off = self.names.len() as u32;
+        let nm = &name[..floor_char_boundary(name, name.len().min(u16::MAX as usize))];
+        self.names.push_str(nm);
+        let is_dir = self.nodes[i as usize].is_dir();
+        let ext = self.ext_index(nm, is_dir);
+        let n = &mut self.nodes[i as usize];
+        n.name_off = off;
+        n.name_len = nm.len() as u16;
+        n.ext = ext;
+        self.ext_add(i, 1);
+    }
+
+    /// New size/date for a file.
+    pub fn update_file(&mut self, i: u32, size: u64, alloc: u64, modified: i64) {
+        let n = &self.nodes[i as usize];
+        if n.is_dir() {
+            self.nodes[i as usize].modified = modified.max(n.modified);
+            return;
+        }
+        let (ds, da) = (size as i64 - n.size as i64, alloc as i64 - n.alloc as i64);
+        let parent = n.parent;
+        self.ext_add(i, -1);
+        let n = &mut self.nodes[i as usize];
+        n.size = size;
+        n.alloc = alloc;
+        n.modified = modified;
+        self.ext_add(i, 1);
+        if parent != NONE {
+            self.adjust_ancestors(parent, ds, da, 0, 0);
         }
     }
 
@@ -390,7 +556,6 @@ pub fn build_tree(
         }
     }
     drop(parent_ids);
-    drop(id_to_node);
 
     // Drop anything whose ancestor chain doesn't reach the root (orphans, cycles).
     // state: 0 unknown, 1 reaches root, 2 doesn't
@@ -540,6 +705,10 @@ pub fn build_tree(
         scan_ms: 0,
         sep: std::path::MAIN_SEPARATOR,
         remote: None,
+        id_map: if method == ScanMethod::Mft { id_to_node } else { Vec::new() },
+        extra_children: HashMap::new(),
+        ext_lookup: ext_map,
+        usn: None,
     }
 }
 
@@ -576,6 +745,47 @@ mod tests {
             alloc: size,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn live_changes_keep_totals_right() {
+        let entries = vec![e(0, 0, "", true, 0), e(1, 0, "a", true, 0), e(2, 1, "x.txt", false, 10), e(3, 0, "b", true, 0), e(4, 3, "y.bin", false, 5)];
+        let mut t = build_tree(entries, 5, 0, "R:\\", ScanMethod::Mft);
+        let r = t.root;
+        let id = |t: &Tree, rec: u32| t.id_map[rec as usize];
+        // grow a file
+        let x = id(&t, 2);
+        t.update_file(x, 110, 110, 5);
+        assert_eq!(t.node(r).size, 115);
+        assert_eq!(t.node(id(&t, 1)).size, 110);
+        // new file in b
+        let b = id(&t, 3);
+        let z = t.add_node(b, "z.log", 0, 40, 40, 1, Some(9));
+        assert_eq!(t.node(b).size, 45);
+        assert_eq!(t.node(r).files, 3);
+        assert_eq!(t.id_map[9], z);
+        assert!(t.children(b).any(|c| c == z));
+        assert_eq!(t.ext_name(z), "log");
+        // move folder a (with x) into b
+        let a = id(&t, 1);
+        t.move_node(a, b);
+        assert_eq!(t.node(b).size, 155);
+        assert_eq!(t.node(r).size, 155);
+        assert_eq!(t.node(r).dirs, 2);
+        assert!(!t.children(r).any(|c| c == a), "moved node must vanish from old parent");
+        assert!(t.path(x).replace('/', "\\").ends_with("b\\a\\x.txt"));
+        // rename + delete
+        t.rename(x, "renamed.md");
+        assert_eq!(t.ext_name(x), "md");
+        t.mark_deleted(a);
+        assert_eq!(t.node(r).size, 45);
+        assert_eq!(t.node(r).files, 2);
+        // move back a node that came from the CSR array: no duplicates
+        let y = id(&t, 4);
+        t.move_node(y, r);
+        t.move_node(y, b);
+        assert_eq!(t.children(b).filter(|&c| c == y).count(), 1);
+        assert_eq!(t.node(r).size, 45);
     }
 
     #[test]
