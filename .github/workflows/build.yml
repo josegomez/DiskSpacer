@@ -16,8 +16,8 @@ jobs:
       - run: cargo build --release
       - uses: actions/upload-artifact@v4
         with:
-          name: DiskSpacer-windows-x64
-          path: target/release/diskspacer.exe
+          name: SizeMatters-windows-x64
+          path: target/release/sizematters.exe
 
   linux-tests:
     runs-on: ubuntu-latest

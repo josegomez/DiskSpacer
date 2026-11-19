@@ -1,4 +1,4 @@
-# DiskSpacer
+# SizeMatters
 
 A fast Windows disk space analyzer written in Rust. It reads the NTFS **Master File Table** directly, the same technique Everything and WizTree use, so a whole drive with millions of files is indexed in seconds instead of minutes. There is no directory walk.
 
@@ -47,13 +47,13 @@ rustup target add x86_64-pc-windows-gnu   # plus: apt install mingw-w64
 cargo build --release --target x86_64-pc-windows-gnu
 ```
 
-CI (`.github/workflows/build.yml`) builds and tests on Windows and uploads `diskspacer.exe` as an artifact.
+CI (`.github/workflows/build.yml`) builds and tests on Windows and uploads `sizematters.exe` as an artifact.
 
 ## Usage
 
-- Run `diskspacer.exe`, pick a drive and click **Scan**. Run it as administrator for the instant MFT scan.
-- `diskspacer.exe D:\` starts scanning a drive or folder right away.
-- `diskspacer.exe --cli C:` runs a headless scan and prints timings and the largest items (handy for benchmarking). It also accepts an NTFS image file.
+- Run `sizematters.exe`, pick a drive and click **Scan**. Run it as administrator for the instant MFT scan.
+- `sizematters.exe D:\` starts scanning a drive or folder right away.
+- `sizematters.exe --cli C:` runs a headless scan and prints timings and the largest items (handy for benchmarking). It also accepts an NTFS image file.
 
 | Shortcut | Action |
 |---|---|

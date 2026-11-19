@@ -69,7 +69,7 @@ pub fn protected_reason(t: &Tree, node: u32, path: &Path) -> Option<String> {
     if let Ok(exe) = std::env::current_exe()
         && (exe == path || exe.starts_with(path))
     {
-        return Some("contains DiskSpacer itself".into());
+        return Some("contains SizeMatters itself".into());
     }
     // Only enforce the Windows layout rules at the top of a drive.
     let ps = path.to_string_lossy().to_lowercase();

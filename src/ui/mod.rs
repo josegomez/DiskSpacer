@@ -139,6 +139,7 @@ pub struct App {
     progress: Arc<Progress>,
     scan_started: Instant,
     scanning: Option<PathBuf>,
+    logo: egui::TextureHandle,
 }
 
 impl App {
@@ -199,6 +200,7 @@ impl App {
             progress: Arc::new(Progress::default()),
             scan_started: Instant::now(),
             scanning: None,
+            logo: ctx.load_texture("logo", egui::ColorImage::from_rgba_unmultiplied([64, 64], crate::ICON_RGBA), egui::TextureOptions::LINEAR),
         };
         if let Some(p) = initial {
             app.start_scan(p, ctx);
@@ -379,7 +381,7 @@ impl App {
     }
 }
 
-/// With DISKSPACER_FRAME_LOG set, prints how long each UI frame took (for profiling).
+/// With SIZEMATTERS_FRAME_LOG set, prints how long each UI frame took (for profiling).
 struct FrameLog(Instant, Option<f32>);
 static LAST_UI_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 impl Drop for FrameLog {
@@ -387,7 +389,7 @@ impl Drop for FrameLog {
         let ms = self.0.elapsed().as_secs_f64() * 1000.0;
         LAST_UI_MS.store((ms as f32).to_bits(), Ordering::Relaxed);
         static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *ON.get_or_init(|| std::env::var_os("DISKSPACER_FRAME_LOG").is_some()) {
+        if *ON.get_or_init(|| std::env::var_os("SIZEMATTERS_FRAME_LOG").is_some()) {
             eprintln!("frame {ms:.2} ms full_prev {:.2} ms", self.1.unwrap_or(0.0) * 1000.0);
         }
     }
@@ -400,7 +402,8 @@ impl Drop for FrameLog {
 impl App {
     fn toolbar(&mut self, ui: &mut Ui, scan_req: &mut Option<PathBuf>) {
         ui.horizontal(|ui| {
-            ui.label(RichText::new("◧ DiskSpacer").size(18.0).strong().color(ACCENT));
+            ui.add(egui::Image::new((self.logo.id(), vec2(24.0, 24.0))));
+            ui.label(RichText::new("SizeMatters").size(18.0).strong().color(Color32::WHITE));
             ui.add_space(10.0);
             let scanning = self.scan_rx.is_some();
             let drives = &self.st.drives;
@@ -492,7 +495,7 @@ impl App {
                 } else if cfg!(windows) {
                     if ui
                         .button(RichText::new("⚡ Restart as administrator for instant MFT scan").color(WARN))
-                        .on_hover_text("Reading the NTFS Master File Table directly requires administrator rights.\nWithout it DiskSpacer falls back to a (much slower) folder walk.")
+                        .on_hover_text("Reading the NTFS Master File Table directly requires administrator rights.\nWithout it SizeMatters falls back to a (much slower) folder walk.")
                         .clicked()
                     {
                         let arg = self.tree.as_ref().map(|t| t.name(t.root).to_string()).or_else(|| self.st.drives.get(self.st.drive_pick).map(|d| d.root.display().to_string())).unwrap_or_default();
@@ -513,7 +516,7 @@ impl App {
             ui.label(RichText::new("What's using my disk?").size(30.0).strong());
             ui.add_space(4.0);
             ui.label(
-                RichText::new("Pick a drive. DiskSpacer reads the NTFS Master File Table directly, so millions of files are indexed in seconds.")
+                RichText::new("Pick a drive. SizeMatters reads the NTFS Master File Table directly, so millions of files are indexed in seconds.")
                     .size(14.0)
                     .weak(),
             );
@@ -1573,7 +1576,7 @@ fn results_table(ui: &mut Ui, t: &Tree, st: &State, ids: &[u32], salt: &str, act
             acts.push(Action::CheckMany(on, true));
         }
         if ui.small_button("⬇ CSV").on_hover_text("Export this list").clicked()
-            && let Some(p) = rfd::FileDialog::new().set_file_name("diskspacer.csv").save_file()
+            && let Some(p) = rfd::FileDialog::new().set_file_name("sizematters.csv").save_file()
         {
             let mut s = String::from("path,size,allocated,modified,created\n");
             for &i in ids {

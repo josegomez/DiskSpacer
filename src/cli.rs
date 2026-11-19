@@ -1,4 +1,4 @@
-//! Headless mode: `diskspacer --cli <drive-or-folder|ntfs-image> [--top N]`
+//! Headless mode: `sizematters --cli <drive-or-folder|ntfs-image> [--top N]`
 //! Prints scan timing and the largest folders/files. Useful for benchmarking.
 
 use crate::model::{ScanMethod, build_tree};
@@ -8,7 +8,7 @@ use std::time::Instant;
 
 pub fn run(args: &[String]) -> i32 {
     let Some(target) = args.first() else {
-        eprintln!("usage: diskspacer --cli <C: | folder | image.ntfs> [--top N]");
+        eprintln!("usage: sizematters --cli <C: | folder | image.ntfs> [--top N]");
         return 2;
     };
     let top: usize = args.iter().position(|a| a == "--top").and_then(|p| args.get(p + 1)).and_then(|s| s.parse().ok()).unwrap_or(15);

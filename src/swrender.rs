@@ -156,7 +156,8 @@ impl ApplicationHandler<UserEvent> for Runner {
             return;
         }
         let attrs = Window::default_attributes()
-            .with_title("DiskSpacer")
+            .with_title("SizeMatters")
+            .with_window_icon(winit::window::Icon::from_rgba(crate::ICON_RGBA.to_vec(), 64, 64).ok())
             .with_inner_size(winit::dpi::LogicalSize::new(1480.0, 900.0))
             .with_min_inner_size(winit::dpi::LogicalSize::new(900.0, 560.0));
         let window = Rc::new(event_loop.create_window(attrs).expect("create window"));

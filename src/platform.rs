@@ -179,7 +179,7 @@ mod imp {
     }
 
     pub fn is_remote_session() -> bool {
-        std::env::var_os("DISKSPACER_REMOTE").is_some()
+        std::env::var_os("SIZEMATTERS_REMOTE").is_some()
     }
 
     pub fn is_elevated() -> bool {
