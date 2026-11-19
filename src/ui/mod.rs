@@ -1,14 +1,15 @@
-mod sunburst;
+mod strata;
 mod theme;
 pub mod treemap;
 
+use crate::category::{self, Category};
 use crate::delete::{self, Method, Plan};
 use crate::filter::{self, FilterSpec, Kind};
 use crate::model::{NONE, ScanMethod, Tree, flags};
 use crate::platform::{self, DriveInfo};
 use crate::scan::{self, ScanMsg, ScanRequest, mft::Progress};
 use crate::util::{fmt_count, fmt_date, fmt_size};
-use egui::{Align, Align2, Color32, FontId, Key, Pos2, RichText, Sense, Stroke, StrokeKind, Ui, Vec2, pos2, vec2};
+use egui::{Align, Align2, Color32, FontId, Key, Pos2, RichText, Sense, Stroke, StrokeKind, Ui, pos2, vec2};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -18,12 +19,13 @@ use theme::{ACCENT, DANGER, OK, WARN};
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
+    Strata,
     Treemap,
-    Sunburst,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 enum ColorMode {
+    Folder,
     Type,
     Age,
 }
@@ -53,7 +55,7 @@ enum Action {
 }
 
 struct TmCache {
-    key: (u32, usize, usize, bool, ColorMode, u64, Option<u16>),
+    key: (u32, usize, usize, bool, ColorMode, u64, Option<u16>, Option<Category>),
     layout: treemap::Layout,
     tex: egui::TextureHandle,
 }
@@ -94,7 +96,11 @@ struct State {
     highlight_ext: Option<u16>,
     generation: u64,
     tm: Option<TmCache>,
-    sb: Option<((u32, bool, u64), sunburst::Layout, Vec<f32>)>,
+    strata: strata::StrataState,
+    show_free: bool,
+    cats: Vec<Category>,
+    highlight_cat: Option<Category>,
+    cat_cache: Option<((u32, u64), [(u64, u64, u64); 10])>,
 
     tab: Tab,
     search_text: String,
@@ -144,13 +150,17 @@ impl App {
                 rows: Vec::new(),
                 rows_dirty: true,
                 scroll_to_selected: false,
-                view: View::Treemap,
-                color_mode: ColorMode::Type,
+                view: View::Strata,
+                color_mode: ColorMode::Folder,
                 use_alloc: true,
                 highlight_ext: None,
                 generation: 0,
                 tm: None,
-                sb: None,
+                strata: strata::StrataState::default(),
+                show_free: true,
+                cats: Vec::new(),
+                highlight_cat: None,
+                cat_cache: None,
                 tab: Tab::Overview,
                 search_text: String::new(),
                 search_results: Vec::new(),
@@ -203,7 +213,10 @@ impl App {
                 st.expanded.insert(t.root);
                 st.rows_dirty = true;
                 st.tm = None;
-                st.sb = None;
+                st.strata = strata::StrataState::default();
+                st.cats = category::ext_categories(&t);
+                st.cat_cache = None;
+                st.highlight_cat = None;
                 st.largest = None;
                 st.checked.clear();
                 st.filter_results.clear();
@@ -300,10 +313,10 @@ impl eframe::App for App {
             handle_keys(&ctx, t, st, &mut acts);
             run_search_if_due(t, st, &ctx);
 
-            egui::Panel::right("side").default_size(430.0).size_range(320.0..=900.0).show(ui, |ui| {
+            egui::Panel::right("side").default_size(400.0).size_range(320.0..=900.0).show(ui, |ui| {
                 side_panel(ui, t, st, &mut acts);
             });
-            egui::Panel::left("tree").default_size(560.0).size_range(260.0..=1100.0).show(ui, |ui| {
+            egui::Panel::left("tree").default_size(390.0).size_range(260.0..=1100.0).show(ui, |ui| {
                 tree_table(ui, t, st, &mut acts);
             });
             egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::from_rgb(18, 20, 24)).inner_margin(8)).show(ui, |ui| {
@@ -357,11 +370,12 @@ impl App {
             if self.tree.is_some() {
                 ui.separator();
                 let st = &mut self.st;
-                ui.selectable_value(&mut st.view, View::Treemap, "▦ Treemap");
-                ui.selectable_value(&mut st.view, View::Sunburst, "◕ Sunburst");
+                ui.selectable_value(&mut st.view, View::Strata, "▤ Strata").on_hover_text("The disk as stacked bars: each row splits the folder above it");
+                ui.selectable_value(&mut st.view, View::Treemap, "▦ Treemap").on_hover_text("Dense cushion treemap");
                 ui.separator();
-                ui.selectable_value(&mut st.color_mode, ColorMode::Type, "By type").on_hover_text("Colour files by extension");
-                ui.selectable_value(&mut st.color_mode, ColorMode::Age, "By age").on_hover_text("Colour files by last modified: red = recent, blue = old");
+                ui.selectable_value(&mut st.color_mode, ColorMode::Folder, "By folder").on_hover_text("Each top-level branch gets its own colour");
+                ui.selectable_value(&mut st.color_mode, ColorMode::Type, "By type").on_hover_text("Colour files by kind: videos, images, apps…");
+                ui.selectable_value(&mut st.color_mode, ColorMode::Age, "By age").on_hover_text("Colour by last modified: amber = recent, blue = old");
                 ui.separator();
                 ui.selectable_value(&mut st.use_alloc, true, "On disk").on_hover_text("Measure by allocated space (what you get back when deleting)");
                 ui.selectable_value(&mut st.use_alloc, false, "Size").on_hover_text("Measure by logical file size");
@@ -921,18 +935,113 @@ fn center_view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
         }
     });
     ui.add_space(4.0);
+    category_bar(ui, t, st);
+    ui.add_space(8.0);
     match st.view {
+        View::Strata => strata::view(ui, t, st, acts),
         View::Treemap => treemap_view(ui, t, st, acts),
-        View::Sunburst => sunburst_view(ui, t, st, acts),
     }
+}
+
+pub(crate) fn cat_color(c: Category) -> Color32 {
+    let (l, ch, h) = match c {
+        Category::Videos => (0.66, 0.16, 25.0),
+        Category::Images => (0.72, 0.15, 145.0),
+        Category::Music => (0.68, 0.15, 305.0),
+        Category::Documents => (0.70, 0.12, 245.0),
+        Category::Archives => (0.78, 0.14, 80.0),
+        Category::Apps => (0.68, 0.12, 200.0),
+        Category::Code => (0.76, 0.13, 115.0),
+        Category::Games => (0.64, 0.17, 345.0),
+        Category::System => (0.55, 0.03, 255.0),
+        Category::Other => (0.64, 0.02, 255.0),
+    };
+    strata::oklch(l, ch, h)
+}
+
+fn file_cat_color(t: &Tree, _st: &State, cats: &[Category], i: u32) -> Color32 {
+    cat_color(category::of_node(t, cats, i))
+}
+
+/// Phone-style storage bar: what kind of data fills the current folder.
+fn category_bar(ui: &mut Ui, t: &Tree, st: &mut State) {
+    let key = (st.view_root, st.generation);
+    if st.cat_cache.as_ref().is_none_or(|c| c.0 != key) {
+        st.cat_cache = Some((key, category::breakdown(t, &st.cats, st.view_root)));
+    }
+    let data = st.cat_cache.as_ref().unwrap().1;
+    let metric = |d: &(u64, u64, u64)| if st.use_alloc { d.1 } else { d.0 };
+    let total: u64 = data.iter().map(metric).sum::<u64>().max(1);
+    let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 14.0), Sense::click());
+    let p = ui.painter_at(rect);
+    p.rect_filled(rect, 7.0, Color32::from_rgb(30, 33, 40));
+    let mut x = rect.left();
+    let mut hover_cat = None;
+    for c in category::ALL {
+        let v = metric(&data[c.index()]);
+        if v == 0 {
+            continue;
+        }
+        let w = rect.width() * v as f32 / total as f32;
+        let r = egui::Rect::from_min_size(pos2(x, rect.top()), vec2(w, rect.height()));
+        let mut col = cat_color(c);
+        if st.highlight_cat.is_some_and(|h| h != c) {
+            col = col.gamma_multiply(0.3);
+        }
+        p.rect_filled(r, 0.0, col);
+        if resp.hover_pos().is_some_and(|hp| r.contains(hp)) {
+            hover_cat = Some((c, v));
+        }
+        x += w;
+    }
+    // round the ends by redrawing the frame corners
+    p.rect_stroke(rect, 7.0, Stroke::new(2.0, Color32::from_rgb(18, 20, 24)), StrokeKind::Outside);
+    if let Some((c, v)) = hover_cat {
+        let resp = resp.on_hover_text(format!("{} {} · {} · {:.1}%", c.icon(), c.label(), fmt_size(v), v as f64 * 100.0 / total as f64));
+        if resp.clicked() {
+            st.highlight_cat = if st.highlight_cat == Some(c) { None } else { Some(c) };
+        }
+    }
+    ui.add_space(3.0);
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 10.0;
+        for c in category::ALL {
+            let v = metric(&data[c.index()]);
+            if v == 0 {
+                continue;
+            }
+            let on = st.highlight_cat == Some(c);
+            let dim = st.highlight_cat.is_some() && !on;
+            let col = cat_color(c);
+            let mut job = egui::text::LayoutJob::default();
+            job.append("● ", 0.0, egui::TextFormat::simple(FontId::proportional(12.0), if dim { col.gamma_multiply(0.35) } else { col }));
+            job.append(
+                &format!("{} {}", c.label(), fmt_size(v)),
+                0.0,
+                egui::TextFormat::simple(FontId::proportional(11.5), if on { Color32::WHITE } else if dim { Color32::from_gray(110) } else { Color32::from_gray(190) }),
+            );
+            if ui.add(egui::Label::new(job).sense(Sense::click())).on_hover_text("Click to highlight this kind of file").clicked() {
+                st.highlight_cat = if on { None } else { Some(c) };
+            }
+        }
+        if st.view_root == t.root && st.use_alloc && t.volume_total > 0 && platform::drive_letter_root(std::path::Path::new(t.name(t.root))).is_some() {
+            ui.checkbox(&mut st.show_free, RichText::new("show free space").size(11.5));
+        }
+    });
 }
 
 fn file_color(t: &Tree, st: &State, i: u32) -> Color32 {
     let n = t.node(i);
     let c = match st.color_mode {
-        ColorMode::Type => st.ext_colors.get(n.ext as usize).copied().unwrap_or(Color32::GRAY),
+        ColorMode::Folder => st.ext_colors.get(n.ext as usize).copied().unwrap_or(Color32::GRAY),
+        ColorMode::Type => cat_color(category::of_node(t, &st.cats, i)),
         ColorMode::Age => theme::age_color(n.modified, st.now),
     };
+    if let Some(hc) = st.highlight_cat
+        && category::of_node(t, &st.cats, i) != hc
+    {
+        return Color32::from_rgb(60, 62, 70);
+    }
     match st.highlight_ext {
         Some(h) if h != n.ext => Color32::from_rgb(60, 62, 70),
         _ => c,
@@ -947,7 +1056,7 @@ fn treemap_view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
     if w < 8 || h < 8 {
         return;
     }
-    let key = (st.view_root, w, h, st.use_alloc, st.color_mode, st.generation, st.highlight_ext);
+    let key = (st.view_root, w, h, st.use_alloc, st.color_mode, st.generation, st.highlight_ext, st.highlight_cat);
     if st.tm.as_ref().is_none_or(|c| c.key != key) {
         let layout = treemap::layout(t, st.view_root, w, h, &treemap::Params { use_alloc: st.use_alloc, headers: true, max_cells: 250_000 });
         let st_ref: &State = st;
@@ -1030,97 +1139,6 @@ fn treemap_view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
     if resp.clicked_by(egui::PointerButton::Extra1) {
         acts.push(Action::ZoomOut);
     }
-}
-
-fn sunburst_view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
-    let rect = ui.available_rect_before_wrap();
-    let resp = ui.allocate_rect(rect, Sense::click());
-    let key = (st.view_root, st.use_alloc, st.generation);
-    if st.sb.as_ref().is_none_or(|c| c.0 != key) {
-        let l = sunburst::layout(t, st.view_root, st.use_alloc);
-        // hue per top-level branch (golden-ratio spread), inherited by descendants
-        let mut hues = vec![0.0f32; l.segs.len()];
-        let mut k = 0;
-        for (si, s) in l.segs.iter().enumerate() {
-            if s.ring == 0 {
-                hues[si] = (k as f32 * 0.618_034).fract();
-                k += 1;
-            } else {
-                let parent = t.node(s.node).parent;
-                if let Some(pi) = l.segs[..si].iter().rposition(|x| x.node == parent) {
-                    hues[si] = hues[pi];
-                }
-            }
-        }
-        st.sb = Some((key, l, hues));
-    }
-    let (_, l, hues) = st.sb.as_ref().unwrap();
-    let g = sunburst::geometry(rect, l.rings);
-    let painter = ui.painter_at(rect);
-    let hover_hit = resp.hover_pos().and_then(|p| sunburst::hit(l, &g, p));
-    let hover_node = match &hover_hit {
-        Some(sunburst::Hit::Seg(s)) => Some(s.node),
-        _ => None,
-    };
-    let seg_idx: std::collections::HashMap<u32, usize> = l.segs.iter().enumerate().map(|(i, s)| (s.node, i)).collect();
-    let color_of = |s: &sunburst::Seg| -> Color32 {
-        let n = t.node(s.node);
-        if n.is_dir() {
-            let h = seg_idx.get(&s.node).map(|&i| hues[i]).unwrap_or(0.0);
-            let base = theme::hsv(h, 0.55, (0.88 - s.ring as f32 * 0.06).max(0.45));
-            match st.highlight_ext {
-                Some(_) => base.lerp_to_gamma(Color32::from_rgb(50, 52, 60), 0.7),
-                None => base,
-            }
-        } else {
-            file_color(t, st, s.node)
-        }
-    };
-    let mesh = sunburst::mesh(l, &g, &color_of, hover_node.or(st.selected));
-    painter.add(egui::Shape::mesh(mesh));
-    // center disc
-    painter.circle_filled(g.center, g.r0 - 2.0, Color32::from_rgb(34, 38, 48));
-    let center_name = elide(&short_name(t, st.view_root), ((g.r0 * 2.0 - 16.0) / 7.0) as usize);
-    painter.text(g.center - vec2(0.0, 9.0), Align2::CENTER_CENTER, center_name, FontId::proportional(13.0), Color32::WHITE);
-    painter.text(g.center + vec2(0.0, 9.0), Align2::CENTER_CENTER, fmt_size(n_metric(t, st.view_root, st.use_alloc)), FontId::proportional(15.0), ACCENT);
-    // labels on big inner segments
-    for s in &l.segs {
-        if s.ring > 1 {
-            continue;
-        }
-        let mid_r = g.r0 + (s.ring as f32 + 0.5) * g.ring_w;
-        if (s.a1 - s.a0) * mid_r < 70.0 {
-            continue;
-        }
-        let a = (s.a0 + s.a1) * 0.5 - std::f32::consts::TAU / 4.0;
-        let p = g.center + Vec2::new(a.cos(), a.sin()) * mid_r;
-        let name: String = t.name(s.node).chars().take(16).collect();
-        painter.text(p + vec2(1.0, 1.0), Align2::CENTER_CENTER, &name, FontId::proportional(11.0), Color32::from_black_alpha(170));
-        painter.text(p, Align2::CENTER_CENTER, &name, FontId::proportional(11.0), Color32::WHITE);
-    }
-    st.hovered = hover_node;
-    match hover_hit {
-        Some(sunburst::Hit::Center) => {
-            let resp = resp.on_hover_text("Click to go up a level");
-            if resp.clicked() {
-                acts.push(Action::ZoomOut);
-            }
-        }
-        Some(sunburst::Hit::Seg(s)) => {
-            let node = s.node;
-            let resp = resp.on_hover_ui_at_pointer(|ui| node_tooltip(ui, t, node));
-            if resp.clicked() {
-                if t.node(node).is_dir() {
-                    acts.push(Action::Zoom(node));
-                }
-                acts.push(Action::Select(node));
-            }
-            resp.context_menu(|ui| node_menu(ui, t, st, node, acts));
-        }
-        None => {}
-    }
-    // legend
-    painter.text(rect.left_bottom() + vec2(6.0, -6.0), Align2::LEFT_BOTTOM, "Click a folder to zoom in · click the centre to go up", FontId::proportional(11.0), Color32::from_gray(130));
 }
 
 // ======================================================================

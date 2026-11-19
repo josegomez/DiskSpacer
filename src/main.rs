@@ -1,6 +1,7 @@
 // Hide the console window for the GUI in release builds on Windows.
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod category;
 mod cli;
 mod delete;
 mod filter;
