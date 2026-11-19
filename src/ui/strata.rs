@@ -6,7 +6,7 @@
 //! per frame in absolute "fraction of the drive" coordinates, so a zoom is just an
 //! animated change of the visible window.
 
-use super::{Action, ColorMode, State, file_cat_color, n_metric, node_menu, node_tooltip};
+use super::{Action, ColorMode, State, chart_context_menu, file_cat_color, n_metric, node_tooltip};
 use crate::category;
 use crate::model::{NONE, Tree};
 use crate::util::fmt_size;
@@ -23,16 +23,29 @@ pub struct Anim {
     start: Instant,
 }
 
+type Kids = std::rc::Rc<Vec<(u32, u64)>>;
+
 #[derive(Default)]
 pub struct StrataState {
+    /// Sorted children per folder, cached for the current (generation, metric):
+    /// avoids re-collecting huge folders (100k+ entries) every frame.
+    kid_cache: std::cell::RefCell<(u64, bool, std::collections::HashMap<u32, Kids>)>,
     /// Last displayed (window start, window end, depth offset).
     shown: Option<(f64, f64, f32)>,
     target_root: u32,
     anim: Option<Anim>,
 }
 
-/// Children sorted by the active metric, with their weights.
-fn kids(t: &Tree, i: u32, use_alloc: bool) -> Vec<(u32, u64)> {
+/// Children sorted by the active metric (cached).
+fn kids(t: &Tree, st: &State, i: u32) -> Kids {
+    let mut c = st.strata.kid_cache.borrow_mut();
+    if c.0 != st.generation || c.1 != st.use_alloc {
+        *c = (st.generation, st.use_alloc, Default::default());
+    }
+    c.2.entry(i).or_insert_with(|| std::rc::Rc::new(kids_uncached(t, i, st.use_alloc))).clone()
+}
+
+fn kids_uncached(t: &Tree, i: u32, use_alloc: bool) -> Vec<(u32, u64)> {
     let mut v: Vec<(u32, u64)> = t.children(i).map(|c| (c, n_metric(t, c, use_alloc))).filter(|k| k.1 > 0).collect();
     if !use_alloc {
         v.sort_by(|a, b| b.1.cmp(&a.1));
@@ -68,7 +81,7 @@ fn interval(t: &Tree, st: &State, node: u32) -> (f64, f64) {
         }
         let mut off = 0u64;
         let mut wc = 0u64;
-        for (k, wt) in kids(t, p, st.use_alloc) {
+        for &(k, wt) in kids(t, st, p).iter() {
             if k == c {
                 wc = wt;
                 break;
@@ -245,7 +258,7 @@ impl Paint<'_> {
         if total <= 0.0 {
             return;
         }
-        let ks = kids(t, node, self.st.use_alloc);
+        let ks = kids(t, self.st, node);
         let span = a1 - a0;
         let mut off = 0u64;
         let px_per_unit = (x1 - x0) as f64 / total;
@@ -264,7 +277,7 @@ impl Paint<'_> {
                         if self.st.color_mode == ColorMode::Type {
                             // tint by the dominant kind of file in the merged items
                             let mut by_cat = [0u64; 10];
-                            for &(c, w) in &ks[k..] {
+                            for &(c, w) in ks[k..].iter().take(2000) {
                                 if !t.node(c).is_dir() {
                                     by_cat[category::of_node(t, self.cats, c).index()] += w;
                                 }
@@ -292,7 +305,7 @@ impl Paint<'_> {
                             self.hit = Some((node, true, rest as u32));
                         }
                         if r.width() >= 70.0 {
-                            let rest_size: u64 = ks[k..].iter().map(|x| x.1).sum();
+                            let rest_size: u64 = (total as u64).saturating_sub(off);
                             self.labels.push((r, format!("{rest} smaller"), fmt_size(rest_size), Color32::from_gray(210), false));
                         }
                     }
@@ -390,7 +403,7 @@ pub fn view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
             let mut d = target_depth as u32;
             let mut n = st.view_root;
             loop {
-                let ks = kids(t, n, st.use_alloc);
+                let ks = kids(t, st, n);
                 if ks.len() == 1 && t.node(ks[0].0).is_dir() {
                     n = ks[0].0;
                     d += 1;
@@ -495,16 +508,20 @@ pub fn view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
                     acts.push(Action::Zoom(t.node(node).parent));
                 }
             }
-            resp.context_menu(|ui| node_menu(ui, t, st, node, acts));
+            if resp.secondary_clicked() {
+                acts.push(Action::Select(node));
+                st.menu_node = Some(node);
+            }
         } else {
-            let resp = resp.on_hover_text(format!("{count} smaller items in {} — click to zoom in", t.name(node)));
+            let resp = resp.clone().on_hover_text(format!("{count} smaller items in {} — click to zoom in", t.name(node)));
             if resp.clicked() {
                 acts.push(Action::Zoom(node));
             }
         }
-    } else if resp.secondary_clicked() && st.view_root != t.root {
+    } else if resp.secondary_clicked() && st.menu_node.is_none() && st.view_root != t.root {
         acts.push(Action::ZoomOut);
     }
+    chart_context_menu(&resp, t, st, acts);
 }
 
 /// Longest prefix of `s` (with an ellipsis) that fits in `max_w` points.

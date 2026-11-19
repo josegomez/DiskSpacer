@@ -85,6 +85,9 @@ struct State {
     view_root: u32,
     selected: Option<u32>,
     hovered: Option<u32>,
+    /// Item whose right-click menu is open on a chart (kept across frames, since the
+    /// pointer leaves the item as soon as it moves onto the menu).
+    menu_node: Option<u32>,
     expanded: HashSet<u32>,
     rows: Vec<(u32, u16)>,
     rows_dirty: bool,
@@ -120,6 +123,10 @@ struct State {
     job: Option<(Arc<delete::Job>, Vec<delete::Item>, Method)>,
     report: Option<Report>,
     now: i64,
+    perf_overlay: bool,
+    perf_hist: Vec<f32>,
+    perf_ui_ms: f32,
+    ext_order: Option<((u64, bool), Vec<usize>)>,
 }
 
 pub struct App {
@@ -146,6 +153,7 @@ impl App {
                 view_root: 0,
                 selected: None,
                 hovered: None,
+                menu_node: None,
                 expanded: HashSet::new(),
                 rows: Vec::new(),
                 rows_dirty: true,
@@ -178,6 +186,10 @@ impl App {
                 job: None,
                 report: None,
                 now: chrono::Local::now().timestamp(),
+                perf_overlay: false,
+                perf_hist: Vec::new(),
+                perf_ui_ms: 0.0,
+                ext_order: None,
             },
             scan_rx: None,
             progress: Arc::new(Progress::default()),
@@ -284,8 +296,29 @@ impl App {
 }
 
 impl eframe::App for App {
-    fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+    fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        let frame_start = Instant::now();
+        let _log = FrameLog(frame_start, frame.info().cpu_usage);
         let ctx = ui.ctx().clone();
+        if ctx.input(|i| i.key_pressed(Key::F12)) {
+            self.st.perf_overlay = !self.st.perf_overlay;
+        }
+        self.st.perf_ui_ms = f32::from_bits(LAST_UI_MS.load(Ordering::Relaxed));
+        if self.st.perf_overlay {
+            let full = frame.info().cpu_usage.unwrap_or(0.0) * 1000.0;
+            self.st.perf_hist.push(full);
+            if self.st.perf_hist.len() > 120 {
+                self.st.perf_hist.remove(0);
+            }
+            let avg = self.st.perf_hist.iter().sum::<f32>() / self.st.perf_hist.len() as f32;
+            let max = self.st.perf_hist.iter().cloned().fold(0.0, f32::max);
+            egui::Area::new(egui::Id::unique("perf")).anchor(Align2::RIGHT_BOTTOM, vec2(-10.0, -34.0)).order(egui::Order::Foreground).show(&ctx, |ui| {
+                egui::Frame::popup(ui.style()).show(ui, |ui| {
+                    ui.label(RichText::new(format!("frame CPU  last {full:.1} ms · avg {avg:.1} · max {max:.1}\nui code {:.1} ms (prev frame)", self.st.perf_ui_ms)).monospace().size(11.0));
+                });
+            });
+            ctx.request_repaint_after(Duration::from_millis(250));
+        }
         self.poll_scan();
         self.poll_job();
         if self.scan_rx.is_some() || self.st.job.is_some() {
@@ -331,6 +364,20 @@ impl eframe::App for App {
 
         if let Some(p) = scan_req {
             self.start_scan(p, &ctx);
+        }
+    }
+}
+
+/// With DISKSPACER_FRAME_LOG set, prints how long each UI frame took (for profiling).
+struct FrameLog(Instant, Option<f32>);
+static LAST_UI_MS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+impl Drop for FrameLog {
+    fn drop(&mut self) {
+        let ms = self.0.elapsed().as_secs_f64() * 1000.0;
+        LAST_UI_MS.store((ms as f32).to_bits(), Ordering::Relaxed);
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ON.get_or_init(|| std::env::var_os("DISKSPACER_FRAME_LOG").is_some()) {
+            eprintln!("frame {ms:.2} ms full_prev {:.2} ms", self.1.unwrap_or(0.0) * 1000.0);
         }
     }
 }
@@ -736,17 +783,12 @@ fn tree_row(ui: &mut Ui, t: &Tree, st: &State, i: u32, depth: u16, ri: usize, co
     let icon_col = if is_dir { Color32::from_rgb(240, 196, 90) } else { st.ext_colors.get(n.ext as usize).copied().unwrap_or(Color32::GRAY) };
     draw_icon(&p, pos2(x0 + 22.0, cy), is_dir, n.flags & flags::REPARSE != 0, icon_col);
     let name_max = (rect.left() + cols.bar_x - 8.0) - (x0 + 32.0);
-    let mut name = t.name(i).to_string();
     let name_col = if n.flags & (flags::HIDDEN | flags::SYSTEM | flags::METAFILE) != 0 { Color32::from_gray(150) } else { Color32::from_gray(230) };
     let font = FontId::proportional(13.0);
-    let galley = ui.fonts_mut(|f| f.layout_no_wrap(name.clone(), font.clone(), name_col));
-    if galley.size().x > name_max && name_max > 20.0 {
-        while !name.is_empty() && ui.fonts_mut(|f| f.layout_no_wrap(format!("{name}…"), font.clone(), name_col)).size().x > name_max {
-            name.pop();
-        }
-        name.push('…');
-    }
-    p.text(pos2(x0 + 32.0, cy), Align2::LEFT_CENTER, name, font, name_col);
+    let name = t.name(i);
+    // clip (cheap) instead of measuring/eliding text every frame
+    let name_clip = egui::Rect::from_min_max(pos2(x0 + 30.0, rect.top()), pos2((x0 + 32.0 + name_max).max(x0 + 32.0), rect.bottom()));
+    p.with_clip_rect(name_clip.intersect(rect)).text(pos2(x0 + 32.0, cy), Align2::LEFT_CENTER, name, font, name_col);
 
     // % bar
     let parent_total = if i == t.root {
@@ -804,6 +846,17 @@ fn elide(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(max_chars - 1).collect();
     out.push('…');
     out
+}
+
+/// Right-click menu for the chart views. The target is remembered in `st.menu_node`
+/// so the menu stays open while the pointer moves onto it.
+fn chart_context_menu(resp: &egui::Response, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
+    let Some(node) = st.menu_node.filter(|&n| !t.node(n).is_deleted()) else { return };
+    let st_ref: &State = st;
+    let shown = resp.context_menu(|ui| node_menu(ui, t, st_ref, node, acts));
+    if shown.is_none() && !resp.secondary_clicked() {
+        st.menu_node = None; // menu was dismissed
+    }
 }
 
 /// Expand/collapse triangle, drawn as a shape (no font glyph needed).
@@ -1163,10 +1216,11 @@ fn treemap_view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
             }
             if resp.secondary_clicked() {
                 acts.push(Action::Select(node));
+                st.menu_node = Some(node);
             }
-            resp.context_menu(|ui| node_menu(ui, t, st, node, acts));
         }
     }
+    chart_context_menu(&resp, t, st, acts);
     if resp.clicked_by(egui::PointerButton::Extra1) {
         acts.push(Action::ZoomOut);
     }
@@ -1221,8 +1275,9 @@ fn side_panel(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
                     });
                 }
             } else {
-                let ids = st.search_results.clone();
+                let ids = std::mem::take(&mut st.search_results);
                 results_table(ui, t, st, &ids, "search", acts);
+                st.search_results = ids;
             }
         }
         Tab::Largest => {
@@ -1232,8 +1287,9 @@ fn side_panel(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
                 st.largest = Some((key, filter::run(t, st.view_root, &c, 1000)));
             }
             ui.add(egui::Label::new(RichText::new(format!("Largest files in {}", t.path(st.view_root))).weak()).truncate());
-            let ids = st.largest.as_ref().unwrap().1.clone();
+            let (key, ids) = st.largest.take().unwrap();
             results_table(ui, t, st, &ids, "largest", acts);
+            st.largest = Some((key, ids));
         }
     }
 }
@@ -1270,11 +1326,17 @@ fn overview(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
 
         ui.label(RichText::new("File types").strong());
         ui.label(RichText::new("Click a type to highlight it in the map").weak().size(11.0));
-        let mut order: Vec<usize> = (0..t.exts.len()).filter(|&k| t.exts[k].count > 0).collect();
-        order.sort_by(|&a, &b| {
-            let (ea, eb) = (&t.exts[a], &t.exts[b]);
-            if st.use_alloc { eb.alloc.cmp(&ea.alloc) } else { eb.size.cmp(&ea.size) }
-        });
+        let okey = (st.generation, st.use_alloc);
+        if st.ext_order.as_ref().is_none_or(|o| o.0 != okey) {
+            let mut order: Vec<usize> = (0..t.exts.len()).filter(|&k| t.exts[k].count > 0).collect();
+            order.sort_by(|&a, &b| {
+                let (ea, eb) = (&t.exts[a], &t.exts[b]);
+                if st.use_alloc { eb.alloc.cmp(&ea.alloc) } else { eb.size.cmp(&ea.size) }
+            });
+            order.truncate(60);
+            st.ext_order = Some((okey, order));
+        }
+        let order = st.ext_order.as_ref().unwrap().1.clone();
         let total = if st.use_alloc { r.alloc } else { r.size }.max(1);
         for &k in order.iter().take(60) {
             let e = &t.exts[k];
@@ -1441,8 +1503,9 @@ fn cleanup(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
                 acts.push(Action::CheckMany(st.filter_results.clone(), true));
             }
         });
-        let ids = st.filter_results.clone();
+        let ids = std::mem::take(&mut st.filter_results);
         results_table(ui, t, st, &ids, "filter", acts);
+        st.filter_results = ids;
     }
 }
 
@@ -1453,7 +1516,7 @@ fn results_table(ui: &mut Ui, t: &Tree, st: &State, ids: &[u32], salt: &str, act
         ui.label(RichText::new("No matches.").weak());
         return;
     }
-    let all_checked = ids.iter().all(|i| st.checked.contains(i));
+    let all_checked = st.checked.len() >= ids.len() && ids.iter().all(|i| st.checked.contains(i));
     ui.horizontal(|ui| {
         let mut ac = all_checked;
         if ui.checkbox(&mut ac, "all").changed() {
@@ -1531,7 +1594,20 @@ fn selection_bar(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) 
     }
     // de-dup nested items for an honest total
     let sel: Vec<u32> = st.checked.iter().copied().collect();
-    let total: u64 = sel.iter().filter(|&&i| !sel.iter().any(|&a| a != i && t.is_ancestor(a, i))).map(|&i| t.node(i).alloc).sum();
+    let covered = |i: u32| {
+        let mut p = t.node(i).parent;
+        while p != NONE {
+            if st.checked.contains(&p) {
+                return true;
+            }
+            if p == t.root {
+                break;
+            }
+            p = t.node(p).parent;
+        }
+        false
+    };
+    let total: u64 = sel.iter().filter(|&&i| !covered(i)).map(|&i| t.node(i).alloc).sum();
     ui.horizontal(|ui| {
         ui.label(RichText::new(format!("☑ {} selected · {}", fmt_count(n as u64), fmt_size(total))).strong());
         if ui.small_button("clear").clicked() {

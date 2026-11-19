@@ -25,7 +25,6 @@ fn main() -> eframe::Result {
 
     let force_gl = args.iter().any(|a| a == "--opengl") || std::env::var_os("DISKSPACER_OPENGL").is_some();
     let make = |renderer: eframe::Renderer| {
-        #[cfg_attr(not(windows), allow(unused_mut))]
         let mut o = eframe::NativeOptions {
             viewport: egui::ViewportBuilder::default()
                 .with_title("DiskSpacer")
@@ -36,6 +35,8 @@ fn main() -> eframe::Result {
         };
         // Never touch Vulkan on Windows: some Intel/older drivers crash while merely
         // enumerating Vulkan adapters (igvk64.dll access violation). DirectX 12 only.
+        // One queued frame instead of two: clicks and hovers feel immediate.
+        o.wgpu_options.surface = eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY;
         #[cfg(windows)]
         if let eframe::egui_wgpu::WgpuSetup::CreateNew(c) = &mut o.wgpu_options.wgpu_setup {
             c.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
