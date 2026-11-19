@@ -1,3 +1,4 @@
+mod compare;
 mod strata;
 mod theme;
 pub mod treemap;
@@ -16,6 +17,12 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use theme::{ACCENT, DANGER, OK, WARN};
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Analyze,
+    Compare,
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum View {
@@ -140,6 +147,8 @@ pub struct App {
     scan_started: Instant,
     scanning: Option<PathBuf>,
     logo: egui::TextureHandle,
+    mode: Mode,
+    compare: compare::CompareState,
 }
 
 impl App {
@@ -200,9 +209,18 @@ impl App {
             progress: Arc::new(Progress::default()),
             scan_started: Instant::now(),
             scanning: None,
+            mode: Mode::Analyze,
+            compare: compare::CompareState::default(),
             logo: ctx.load_texture("logo", egui::ColorImage::from_rgba_unmultiplied([64, 64], crate::ICON_RGBA), egui::TextureOptions::LINEAR),
         };
-        if let Some(p) = initial {
+        // `--compare <left> <right>` opens straight into a folder comparison.
+        let args: Vec<String> = std::env::args().collect();
+        if let Some(i) = args.iter().position(|a| a == "--compare")
+            && args.len() > i + 2
+        {
+            app.mode = Mode::Compare;
+            app.compare.preset(&args[i + 1], &args[i + 2], ctx);
+        } else if let Some(p) = initial {
             app.start_scan(p, ctx);
         }
         app
@@ -351,7 +369,9 @@ impl App {
             self.status_bar(ui);
         });
 
-        if let Some(path) = self.scanning.clone() {
+        if self.mode == Mode::Compare {
+            egui::CentralPanel::default().show(ui, |ui| compare::ui(ui, &mut self.compare));
+        } else if let Some(path) = self.scanning.clone() {
             egui::CentralPanel::default().show(ui, |ui| self.scanning_screen(ui, &path));
         } else if let Some(t) = &self.tree {
             let st = &mut self.st;
@@ -405,6 +425,12 @@ impl App {
             ui.add(egui::Image::new((self.logo.id(), vec2(24.0, 24.0))));
             ui.label(RichText::new("SizeMatters").size(18.0).strong().color(Color32::WHITE));
             ui.add_space(10.0);
+            ui.selectable_value(&mut self.mode, Mode::Analyze, RichText::new("📊 Analyze").strong());
+            ui.selectable_value(&mut self.mode, Mode::Compare, RichText::new("⇄ Compare folders").strong());
+            ui.separator();
+            if self.mode == Mode::Compare {
+                return;
+            }
             let scanning = self.scan_rx.is_some();
             let drives = &self.st.drives;
             let cur = drives.get(self.st.drive_pick).map(drive_label).unwrap_or_else(|| "Select drive".into());

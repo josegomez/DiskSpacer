@@ -3,6 +3,7 @@
 
 mod category;
 mod cli;
+mod compare;
 mod delete;
 mod filter;
 mod model;
@@ -25,7 +26,7 @@ fn main() -> eframe::Result {
         }
         std::process::exit(cli::run(&args[1..]));
     }
-    let initial = args.iter().find(|a| !a.starts_with('-')).map(std::path::PathBuf::from);
+    let initial = if args.iter().any(|a| a == "--compare") { None } else { args.iter().find(|a| !a.starts_with('-')).map(std::path::PathBuf::from) };
 
     let force_gl = args.iter().any(|a| a == "--opengl") || std::env::var_os("SIZEMATTERS_OPENGL").is_some();
     let make = |renderer: eframe::Renderer| {
