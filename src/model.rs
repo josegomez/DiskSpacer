@@ -80,6 +80,7 @@ pub struct RawEntry {
 pub enum ScanMethod {
     Mft,
     Walk,
+    Ssh,
 }
 
 impl ScanMethod {
@@ -87,6 +88,7 @@ impl ScanMethod {
         match self {
             ScanMethod::Mft => "NTFS Master File Table (direct)",
             ScanMethod::Walk => "Directory walk",
+            ScanMethod::Ssh => "Remote over SSH",
         }
     }
 }
@@ -109,6 +111,10 @@ pub struct Tree {
     pub volume_total: u64,
     pub volume_free: u64,
     pub scan_ms: u128,
+    /// Path separator for building full paths ('/' for remote Linux trees).
+    pub sep: char,
+    /// Set when the tree was scanned on a remote host over SSH.
+    pub remote: Option<std::sync::Arc<crate::remote::Conn>>,
 }
 
 impl Tree {
@@ -160,7 +166,7 @@ impl Tree {
         let mut s = String::new();
         for (k, p) in parts.iter().enumerate() {
             if k > 0 && !s.ends_with(['\\', '/']) {
-                s.push(std::path::MAIN_SEPARATOR);
+                s.push(self.sep);
             }
             s.push_str(p);
         }
@@ -532,6 +538,8 @@ pub fn build_tree(
         volume_total: 0,
         volume_free: 0,
         scan_ms: 0,
+        sep: std::path::MAIN_SEPARATOR,
+        remote: None,
     }
 }
 

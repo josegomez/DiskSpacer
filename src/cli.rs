@@ -15,7 +15,26 @@ pub fn run(args: &[String]) -> i32 {
     let path = PathBuf::from(target);
     let t0 = Instant::now();
     let progress = mft::Progress::default();
-    let tree = if path.is_file() {
+    let tree = if let Some((mut target, rpath)) = crate::remote::Target::parse_url(target) {
+        // ssh://user@host[:port]/path  (password: SIZEMATTERS_SSH_PASSWORD, key: --key, trust: --trust FP)
+        target.password = std::env::var("SIZEMATTERS_SSH_PASSWORD").ok();
+        target.key_path = args.iter().position(|a| a == "--key").and_then(|p| args.get(p + 1)).map(PathBuf::from);
+        target.trust_fingerprint = args.iter().position(|a| a == "--trust").and_then(|p| args.get(p + 1)).cloned();
+        let p = std::sync::Arc::new(progress);
+        let req = scan::ScanRequest { path: PathBuf::from(rpath), prefer_mft: false, remote: Some(target), conn: None };
+        match scan::start(req, p, egui::Context::default()).recv() {
+            Ok(scan::ScanMsg::Done(t, _)) => *t,
+            Ok(scan::ScanMsg::NeedTrust(_, fp, _)) => {
+                eprintln!("Unknown host key {fp}. Re-run with --trust {fp} to accept it.");
+                return 3;
+            }
+            Ok(scan::ScanMsg::Failed(e)) => {
+                eprintln!("scan failed: {e}");
+                return 1;
+            }
+            Err(_) => return 1,
+        }
+    } else if path.is_file() {
         // An NTFS image file: parse its MFT directly.
         let f = match std::fs::File::open(&path) {
             Ok(f) => f,
@@ -37,7 +56,7 @@ pub fn run(args: &[String]) -> i32 {
     } else {
         let p = std::sync::Arc::new(progress);
         let ctx = egui::Context::default();
-        let rx = scan::start(scan::ScanRequest { path: path.clone(), prefer_mft: true }, p, ctx);
+        let rx = scan::start(scan::ScanRequest { path: path.clone(), prefer_mft: true, remote: None, conn: None }, p, ctx);
         match rx.recv() {
             Ok(scan::ScanMsg::Done(t, note)) => {
                 if let Some(n) = note {
@@ -49,6 +68,7 @@ pub fn run(args: &[String]) -> i32 {
                 eprintln!("scan failed: {e}");
                 return 1;
             }
+            Ok(_) => return 1,
             Err(_) => return 1,
         }
     };

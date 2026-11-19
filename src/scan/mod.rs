@@ -11,14 +11,20 @@ use std::time::Instant;
 pub enum ScanMsg {
     Done(Box<Tree>, Option<String>),
     Failed(String),
+    /// First connection to an SSH host: the user must confirm its key fingerprint.
+    NeedTrust(crate::remote::Target, String, PathBuf),
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct ScanRequest {
     /// A drive root ("C:\") or any folder.
     pub path: PathBuf,
     /// Try the raw MFT reader first.
     pub prefer_mft: bool,
+    /// Scan `path` on this SSH host instead of locally.
+    pub remote: Option<crate::remote::Target>,
+    /// Reuse an existing SSH connection (rescans).
+    pub conn: Option<Arc<crate::remote::Conn>>,
 }
 
 /// Run a scan on a background thread.
@@ -48,6 +54,10 @@ fn run(req: &ScanRequest, progress: &Progress) -> ScanMsg {
         return ScanMsg::Done(Box::new(t), None);
     }
     let mut note = None;
+
+    if req.remote.is_some() || req.conn.is_some() {
+        return run_remote(req, progress, t0);
+    }
 
     if req.prefer_mft
         && let Some(letter) = platform::drive_letter_root(&req.path)
@@ -129,4 +139,44 @@ fn synthetic(n: u32) -> (Vec<crate::model::RawEntry>, u32) {
         id += 1;
     }
     (v, id)
+}
+
+fn run_remote(req: &ScanRequest, progress: &Progress, t0: Instant) -> ScanMsg {
+    use crate::remote::{self, ConnectError};
+    let conn = match &req.conn {
+        Some(c) => c.clone(),
+        None => match remote::Conn::connect(req.remote.as_ref().unwrap()) {
+            Ok(c) => Arc::new(c),
+            Err(ConnectError::UnknownHost { fingerprint }) => return ScanMsg::NeedTrust(req.remote.clone().unwrap(), fingerprint, req.path.clone()),
+            Err(e) => return ScanMsg::Failed(e.to_string()),
+        },
+    };
+    let root = req.path.to_string_lossy().replace('\\', "/");
+    let rp = remote::Progress { entries: Default::default(), bytes: Default::default(), cancel: Default::default() };
+    // mirror progress into the shared counter the UI watches
+    let res = std::thread::scope(|s| {
+        let h = s.spawn(|| remote::scan(&conn, &root, &rp));
+        while !h.is_finished() {
+            progress.done.store(rp.entries.load(std::sync::atomic::Ordering::Relaxed), std::sync::atomic::Ordering::Relaxed);
+            if progress.cancel.load(std::sync::atomic::Ordering::Relaxed) {
+                rp.cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        h.join().unwrap()
+    });
+    match res {
+        Ok((entries, ids)) => {
+            let mut t = build_tree(entries, ids, 0, &root, ScanMethod::Ssh);
+            t.sep = '/';
+            if let Some((total, free)) = conn.disk_space(&root) {
+                t.volume_total = total;
+                t.volume_free = free;
+            }
+            t.remote = Some(conn);
+            t.scan_ms = t0.elapsed().as_millis();
+            ScanMsg::Done(Box::new(t), None)
+        }
+        Err(e) => ScanMsg::Failed(format!("{e:#}")),
+    }
 }

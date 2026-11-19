@@ -99,6 +99,23 @@ pub fn protected_reason(t: &Tree, node: u32, path: &Path) -> Option<String> {
         }
     } else if comps.is_empty() {
         return Some("filesystem root".into());
+    } else if t.sep == '/' {
+        // Linux / Unix layout (local or remote over SSH)
+        const TOP: &[&str] = &["bin", "boot", "dev", "etc", "home", "lib", "lib32", "lib64", "libx32", "proc", "root", "run", "sbin", "srv", "sys", "usr", "var", "snap", "opt", "mnt", "media", "tmp"];
+        const NEVER_INSIDE: &[&str] = &["bin", "boot", "dev", "etc", "lib", "lib32", "lib64", "libx32", "proc", "run", "sbin", "sys", "usr"];
+        let first = comps[0].as_str();
+        if comps.len() == 1 && TOP.contains(&first) {
+            return Some(format!("system folder /{first}"));
+        }
+        if NEVER_INSIDE.contains(&first) {
+            return Some(format!("inside system folder /{first}"));
+        }
+        if comps.len() == 2 && first == "home" {
+            return Some("a whole home directory".into());
+        }
+        if comps.len() >= 2 && first == "var" && comps[1] == "lib" {
+            return Some("/var/lib holds package and service state".into());
+        }
     }
     None
 }
@@ -165,7 +182,7 @@ pub struct Job {
     pub results: parking_lot::Mutex<Vec<(u32, Result<(), String>)>>,
 }
 
-pub fn execute(items: Vec<Item>, method: Method, ctx: egui::Context) -> Arc<Job> {
+pub fn execute(items: Vec<Item>, method: Method, ctx: egui::Context, remote: Option<Arc<crate::remote::Conn>>) -> Arc<Job> {
     let job = Arc::new(Job {
         done: AtomicUsize::new(0),
         total: items.len(),
@@ -177,7 +194,19 @@ pub fn execute(items: Vec<Item>, method: Method, ctx: egui::Context) -> Arc<Job>
     std::thread::Builder::new()
         .name("delete".into())
         .spawn(move || {
-            run(&items, method, &j, &ctx);
+            match &remote {
+                Some(conn) => {
+                    // Remote host: permanent `rm -rf` over SSH (no Recycle Bin there).
+                    let paths: Vec<String> = items.iter().map(|i| i.path.to_string_lossy().into_owned()).collect();
+                    let res = conn.delete(&paths);
+                    let mut r = j.results.lock();
+                    for (it, res) in items.iter().zip(res) {
+                        r.push((it.node, res));
+                    }
+                    j.done.store(items.len(), Ordering::Relaxed);
+                }
+                None => run(&items, method, &j, &ctx),
+            }
             j.finished.store(true, Ordering::SeqCst);
             ctx.request_repaint();
         })

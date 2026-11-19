@@ -8,6 +8,7 @@ mod delete;
 mod filter;
 mod model;
 mod platform;
+mod remote;
 mod scan;
 mod swrender;
 mod ui;

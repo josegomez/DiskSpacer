@@ -660,7 +660,7 @@ mod tests {
 mod fixture_tests {
     use super::*;
     use crate::model::{ScanMethod, build_tree, flags};
-    use std::io::Read as _;
+
 
     /// A real NTFS volume (mkntfs + ntfs-3g) with nested dirs, Unicode names,
     /// 200 hard links, a sparse file and resident (tiny) files.

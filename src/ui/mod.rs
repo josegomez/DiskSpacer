@@ -149,6 +149,58 @@ pub struct App {
     logo: egui::TextureHandle,
     mode: Mode,
     compare: compare::CompareState,
+    ssh_form: Option<SshForm>,
+    scan_is_remote: bool,
+    pending_remote_rescan: Option<(Arc<crate::remote::Conn>, PathBuf)>,
+    trust_prompt: Option<(crate::remote::Target, String, PathBuf)>,
+    last_ssh: Option<SshForm>,
+}
+
+#[derive(Clone)]
+struct SshForm {
+    host: String,
+    port: String,
+    user: String,
+    use_key: bool,
+    password: String,
+    key_path: String,
+    key_pass: String,
+    path: String,
+    error: Option<String>,
+}
+
+impl Default for SshForm {
+    fn default() -> Self {
+        let home = std::env::var("HOME").or_else(|_| std::env::var("USERPROFILE")).unwrap_or_default();
+        SshForm {
+            host: String::new(),
+            port: "22".into(),
+            user: "root".into(),
+            use_key: false,
+            password: String::new(),
+            key_path: if home.is_empty() { String::new() } else { format!("{home}{}.ssh{}id_ed25519", std::path::MAIN_SEPARATOR, std::path::MAIN_SEPARATOR) },
+            key_pass: String::new(),
+            path: "/".into(),
+            error: None,
+        }
+    }
+}
+
+impl SshForm {
+    fn target(&self) -> Result<crate::remote::Target, String> {
+        if self.host.trim().is_empty() || self.user.trim().is_empty() {
+            return Err("host and user are required".into());
+        }
+        Ok(crate::remote::Target {
+            host: self.host.trim().into(),
+            port: self.port.trim().parse().map_err(|_| "bad port".to_string())?,
+            user: self.user.trim().into(),
+            password: (!self.use_key && !self.password.is_empty()).then(|| self.password.clone()),
+            key_path: (self.use_key && !self.key_path.trim().is_empty()).then(|| PathBuf::from(self.key_path.trim())),
+            key_pass: (self.use_key && !self.key_pass.is_empty()).then(|| self.key_pass.clone()),
+            trust_fingerprint: None,
+        })
+    }
 }
 
 impl App {
@@ -211,6 +263,11 @@ impl App {
             scanning: None,
             mode: Mode::Analyze,
             compare: compare::CompareState::default(),
+            ssh_form: None,
+            scan_is_remote: false,
+            pending_remote_rescan: None,
+            trust_prompt: None,
+            last_ssh: None,
             logo: ctx.load_texture("logo", egui::ColorImage::from_rgba_unmultiplied([64, 64], crate::ICON_RGBA), egui::TextureOptions::LINEAR),
         };
         // `--compare <left> <right>` opens straight into a folder comparison.
@@ -227,11 +284,21 @@ impl App {
     }
 
     fn start_scan(&mut self, path: PathBuf, ctx: &egui::Context) {
+        self.start_request(ScanRequest { path, prefer_mft: true, remote: None, conn: None }, ctx);
+    }
+
+    fn start_request(&mut self, req: ScanRequest, ctx: &egui::Context) {
         self.progress = Arc::new(Progress::default());
         self.scan_started = Instant::now();
-        self.scanning = Some(path.clone());
+        let label = match (&req.remote, &req.conn) {
+            (Some(t), _) => PathBuf::from(format!("{}:{}", t.label(), req.path.display())),
+            (None, Some(c)) => PathBuf::from(format!("{}:{}", c.target.label(), req.path.display())),
+            _ => req.path.clone(),
+        };
+        self.scanning = Some(label);
+        self.scan_is_remote = req.remote.is_some() || req.conn.is_some();
         self.st.notice = None;
-        self.scan_rx = Some(scan::start(ScanRequest { path, prefer_mft: true }, self.progress.clone(), ctx.clone()));
+        self.scan_rx = Some(scan::start(req, self.progress.clone(), ctx.clone()));
     }
 
     fn poll_scan(&mut self) {
@@ -241,6 +308,9 @@ impl App {
         self.scanning = None;
         match msg {
             ScanMsg::Done(t, note) => {
+                if t.remote.is_none() {
+                    self.last_ssh = None;
+                }
                 let st = &mut self.st;
                 st.ext_colors = theme::ext_colors(&t);
                 st.view_root = t.root;
@@ -268,7 +338,17 @@ impl App {
                 }
                 self.tree = Some(*t);
             }
-            ScanMsg::Failed(e) => self.st.notice = Some((e, DANGER)),
+            ScanMsg::Failed(e) => {
+                if self.scan_is_remote
+                    && let Some(f) = self.last_ssh.as_mut()
+                {
+                    // reopen the SSH form with the error
+                    f.error = Some(e.clone());
+                    self.ssh_form = Some(f.clone());
+                }
+                self.st.notice = Some((e, DANGER));
+            }
+            ScanMsg::NeedTrust(target, fp, path) => self.trust_prompt = Some((target, fp, path)),
         }
     }
 
@@ -395,6 +475,10 @@ impl App {
         self.apply_actions(acts, &ctx);
         self.modals(&ctx);
 
+        self.ssh_modals(&ctx);
+        if let Some((conn, path)) = self.pending_remote_rescan.take() {
+            self.start_request(ScanRequest { path, prefer_mft: false, remote: None, conn: Some(conn) }, &ctx);
+        }
         if let Some(p) = scan_req {
             self.start_scan(p, &ctx);
         }
@@ -449,10 +533,17 @@ impl App {
             {
                 *scan_req = Some(p);
             }
+            if ui.add_enabled(!scanning, egui::Button::new("🌐 SSH…")).on_hover_text("Scan a remote Linux server over SSH").clicked() {
+                self.ssh_form = Some(self.last_ssh.clone().unwrap_or_default());
+            }
             if let Some(t) = &self.tree
                 && ui.add_enabled(!scanning, egui::Button::new("⟳ Rescan")).clicked()
             {
-                *scan_req = Some(PathBuf::from(t.name(t.root)));
+                if let Some(conn) = &t.remote {
+                    self.pending_remote_rescan = Some((conn.clone(), PathBuf::from(t.name(t.root))));
+                } else {
+                    *scan_req = Some(PathBuf::from(t.name(t.root)));
+                }
             }
             if self.tree.is_some() {
                 ui.separator();
@@ -504,8 +595,10 @@ impl App {
                 let (icon, col) = match t.method {
                     ScanMethod::Mft => ("⚡", OK),
                     ScanMethod::Walk => ("🐢", WARN),
+                    ScanMethod::Ssh => ("🌐", ACCENT),
                 };
-                ui.label(RichText::new(format!("{icon} {}", t.method.label())).color(col));
+                let host = t.remote.as_ref().map(|c| format!(" · {}", c.target.label())).unwrap_or_default();
+                ui.label(RichText::new(format!("{icon} {}{host}", t.method.label())).color(col));
                 ui.separator();
                 ui.label(format!("{} files · {} folders", fmt_count(r.files as u64), fmt_count(r.dirs as u64)));
                 ui.separator();
@@ -566,11 +659,17 @@ impl App {
         }
         ui.add_space(12.0);
         ui.vertical_centered(|ui| {
-            if ui.button(RichText::new("📂  Scan a folder…").size(15.0)).clicked()
-                && let Some(p) = rfd::FileDialog::new().pick_folder()
-            {
-                *scan_req = Some(p);
-            }
+            ui.horizontal(|ui| {
+                ui.add_space((ui.available_width() - 440.0).max(0.0) / 2.0);
+                if ui.button(RichText::new("📂  Scan a folder…").size(15.0)).clicked()
+                    && let Some(p) = rfd::FileDialog::new().pick_folder()
+                {
+                    *scan_req = Some(p);
+                }
+                if ui.button(RichText::new("🌐  Scan a Linux server over SSH…").size(15.0)).clicked() {
+                    self.ssh_form = Some(self.last_ssh.clone().unwrap_or_default());
+                }
+            });
             if cfg!(windows) && !self.st.elevated {
                 ui.add_space(18.0);
                 ui.label(RichText::new("Tip: run as administrator for the instant MFT scan. Without it, a regular folder scan is used.").color(WARN));
@@ -1022,11 +1121,12 @@ fn node_menu(ui: &mut Ui, t: &Tree, st: &State, i: u32, acts: &mut Vec<Action>) 
         acts.push(Action::Zoom(i));
         ui.close();
     }
-    if ui.button("📂 Show in Explorer").clicked() {
+    let local = t.remote.is_none();
+    if local && ui.button("📂 Show in Explorer").clicked() {
         acts.push(Action::Reveal(i));
         ui.close();
     }
-    if ui.button("↗ Open").clicked() {
+    if local && ui.button("↗ Open").clicked() {
         acts.push(Action::Open(i));
         ui.close();
     }
@@ -1045,7 +1145,7 @@ fn node_menu(ui: &mut Ui, t: &Tree, st: &State, i: u32, acts: &mut Vec<Action>) 
         ui.close();
     }
     if i != t.root {
-        if ui.button(RichText::new("🗑 Move to Recycle Bin…").color(WARN)).clicked() {
+        if local && ui.button(RichText::new("🗑 Move to Recycle Bin…").color(WARN)).clicked() {
             acts.push(Action::Delete(vec![i], Method::RecycleBin));
             ui.close();
         }
@@ -1689,13 +1789,136 @@ fn selection_bar(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) 
         }
     });
     ui.horizontal(|ui| {
-        if ui.add(egui::Button::new(RichText::new("🗑 Move to Recycle Bin").strong()).fill(Color32::from_rgb(120, 80, 20))).clicked() {
+        if t.remote.is_none() && ui.add(egui::Button::new(RichText::new("🗑 Move to Recycle Bin").strong()).fill(Color32::from_rgb(120, 80, 20))).clicked() {
             acts.push(Action::Delete(sel.clone(), Method::RecycleBin));
         }
         if ui.add(egui::Button::new(RichText::new("⚠ Delete permanently").strong()).fill(Color32::from_rgb(130, 35, 35))).clicked() {
             acts.push(Action::Delete(sel, Method::Permanent));
         }
     });
+}
+
+// ======================================================================
+// SSH connect form & host-key confirmation
+// ======================================================================
+
+impl App {
+    fn ssh_modals(&mut self, ctx: &egui::Context) {
+        let mut connect: Option<(crate::remote::Target, String)> = None;
+        let mut close = false;
+        if let Some(f) = &mut self.ssh_form {
+            let mr = egui::Modal::new(egui::Id::unique("ssh_form")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.label(RichText::new("🌐 Scan a Linux server over SSH").size(18.0).strong());
+                ui.label(RichText::new("Lists the whole folder tree with one remote `find` command (GNU findutils), streamed and compressed.").weak().size(11.5));
+                ui.add_space(6.0);
+                egui::Grid::new("sshgrid").num_columns(2).spacing([10.0, 6.0]).show(ui, |ui| {
+                    ui.label("Host");
+                    ui.horizontal(|ui| {
+                        ui.add(egui::TextEdit::singleline(&mut f.host).hint_text("server.example.com").desired_width(230.0));
+                        ui.label("port");
+                        ui.add(egui::TextEdit::singleline(&mut f.port).desired_width(48.0));
+                    });
+                    ui.end_row();
+                    ui.label("User");
+                    ui.add(egui::TextEdit::singleline(&mut f.user).desired_width(150.0));
+                    ui.end_row();
+                    ui.label("Sign in with");
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut f.use_key, false, "password");
+                        ui.radio_value(&mut f.use_key, true, "private key");
+                    });
+                    ui.end_row();
+                    if f.use_key {
+                        ui.label("Key file");
+                        ui.horizontal(|ui| {
+                            ui.add(egui::TextEdit::singleline(&mut f.key_path).desired_width(250.0));
+                            if ui.button("📂").clicked()
+                                && let Some(p) = rfd::FileDialog::new().pick_file()
+                            {
+                                f.key_path = p.display().to_string();
+                            }
+                        });
+                        ui.end_row();
+                        ui.label("Passphrase");
+                        ui.add(egui::TextEdit::singleline(&mut f.key_pass).password(true).hint_text("if the key has one").desired_width(200.0));
+                        ui.end_row();
+                    } else {
+                        ui.label("Password");
+                        ui.add(egui::TextEdit::singleline(&mut f.password).password(true).desired_width(200.0));
+                        ui.end_row();
+                    }
+                    ui.label("Folder");
+                    ui.add(egui::TextEdit::singleline(&mut f.path).desired_width(250.0));
+                    ui.end_row();
+                });
+                if let Some(e) = &f.error {
+                    ui.colored_label(DANGER, e);
+                }
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        close = true;
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(egui::Button::new(RichText::new("Connect & scan").strong()).fill(Color32::from_rgb(40, 90, 170))).clicked()
+                            || ui.input(|i| i.key_pressed(Key::Enter))
+                        {
+                            match f.target() {
+                                Ok(t) => connect = Some((t, f.path.trim().to_string())),
+                                Err(e) => f.error = Some(e),
+                            }
+                        }
+                    });
+                });
+            });
+            if mr.should_close() {
+                close = true;
+            }
+        }
+        if let Some((target, path)) = connect {
+            let mut remembered = self.ssh_form.take().unwrap_or_default();
+            remembered.error = None;
+            self.last_ssh = Some(remembered);
+            self.start_request(ScanRequest { path: PathBuf::from(if path.is_empty() { "/".into() } else { path }), prefer_mft: false, remote: Some(target), conn: None }, ctx);
+        } else if close {
+            self.ssh_form = None;
+        }
+
+        // unknown host: confirm fingerprint
+        let mut trust: Option<bool> = None;
+        if let Some((t, fp, _)) = &self.trust_prompt {
+            egui::Modal::new(egui::Id::unique("ssh_trust")).show(ctx, |ui| {
+                ui.set_width(480.0);
+                ui.label(RichText::new("New SSH host").size(18.0).strong());
+                ui.label(format!("{} has not been seen before. Its host key fingerprint is:", t.host));
+                ui.add_space(4.0);
+                ui.label(RichText::new(fp).monospace().size(13.0).color(WARN));
+                ui.add_space(4.0);
+                ui.label(RichText::new("Only continue if this matches the server's real key (ask its administrator, or run `ssh-keygen -lf /etc/ssh/ssh_host_ed25519_key.pub` on it). It will be saved to known_hosts.").weak().size(11.5));
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if ui.button("Cancel").clicked() {
+                        trust = Some(false);
+                    }
+                    ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                        if ui.add(egui::Button::new(RichText::new("Trust & connect").strong()).fill(Color32::from_rgb(40, 90, 170))).clicked() {
+                            trust = Some(true);
+                        }
+                    });
+                });
+            });
+        }
+        match trust {
+            Some(true) => {
+                let (mut t, fp, path) = self.trust_prompt.take().unwrap();
+                t.trust_fingerprint = Some(fp);
+                self.start_request(ScanRequest { path, prefer_mft: false, remote: Some(t), conn: None }, ctx);
+            }
+            Some(false) => self.trust_prompt = None,
+            None => {}
+        }
+    }
 }
 
 // ======================================================================
@@ -1756,6 +1979,7 @@ impl App {
                     st.rows_dirty = true;
                 }
                 Action::Delete(ids, m) => {
+                    let m = if t.remote.is_some() { Method::Permanent } else { m };
                     let plan = delete::plan(t, &ids);
                     st.confirm = Some(Confirm { plan, method: m, typed: String::new(), ack: false });
                 }
@@ -1837,10 +2061,14 @@ impl App {
                     ui.colored_label(WARN, "Some items are hidden system files.");
                 }
                 ui.add_space(8.0);
-                ui.horizontal(|ui| {
-                    ui.radio_value(&mut c.method, Method::RecycleBin, "Recycle Bin (undoable)");
-                    ui.radio_value(&mut c.method, Method::Permanent, "Permanent");
-                });
+                if let Some(conn) = self.tree.as_ref().and_then(|t| t.remote.as_ref()) {
+                    ui.label(RichText::new(format!("🌐 Deleting on {} — remote deletes are permanent (rm -rf, links are not followed).", conn.target.label())).color(WARN));
+                } else {
+                    ui.horizontal(|ui| {
+                        ui.radio_value(&mut c.method, Method::RecycleBin, "Recycle Bin (undoable)");
+                        ui.radio_value(&mut c.method, Method::Permanent, "Permanent");
+                    });
+                }
                 let perm = c.method == Method::Permanent;
                 let big = p.total_alloc > 1 << 30 || p.items.len() > 50;
                 let mut ok_to_go = !p.items.is_empty();
@@ -1874,7 +2102,8 @@ impl App {
             }
         }
         if let Some((items, m)) = start {
-            let job = delete::execute(items.clone(), m, ctx.clone());
+            let remote = self.tree.as_ref().and_then(|t| t.remote.clone());
+            let job = delete::execute(items.clone(), m, ctx.clone(), remote);
             self.st.job = Some((job, items, m));
         }
 
