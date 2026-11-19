@@ -655,3 +655,53 @@ mod tests {
         assert!(!apply_fixup(&mut rec));
     }
 }
+
+#[cfg(test)]
+mod fixture_tests {
+    use super::*;
+    use crate::model::{ScanMethod, build_tree, flags};
+    use std::io::Read as _;
+
+    /// A real NTFS volume (mkntfs + ntfs-3g) with nested dirs, Unicode names,
+    /// 200 hard links, a sparse file and resident (tiny) files.
+    fn image() -> std::io::Cursor<Vec<u8>> {
+        let gz = std::fs::read(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/small_ntfs.img.gz")).unwrap();
+        let mut out = Vec::new();
+        flate2::read::GzDecoder::new(&gz[..]).read_to_end(&mut out).unwrap();
+        std::io::Cursor::new(out)
+    }
+
+    #[test]
+    fn parses_real_ntfs_image() {
+        let (entries, ids, g) = scan_mft(image(), &Progress::default()).unwrap();
+        assert_eq!(g.record_size, 1024);
+        let t = build_tree(entries, ids, ROOT_RECORD, "X:\\", ScanMethod::Mft);
+        let find = |name: &str| (0..t.nodes.len() as u32).find(|&i| t.name(i) == name && t.node(i).parent != crate::model::NONE).unwrap_or_else(|| panic!("{name} missing"));
+
+        let data = find("data.bin");
+        assert_eq!(t.node(data).size, 123456);
+        assert_eq!(t.node(data).alloc, 126976); // 31 clusters of 4K
+        assert!(t.path(data).ends_with("nested\\data.bin") || t.path(data).ends_with("nested/data.bin"));
+
+        let sparse = find("sparse.img");
+        assert_eq!(t.node(sparse).size, 100 << 20);
+        assert_eq!(t.node(sparse).alloc, 0);
+
+        find("naïve.txt");
+        let dir_one = find("dir one");
+        // 100 small files + 1 nested + 200 link names
+        assert_eq!(t.node(dir_one).files, 301);
+        let links = t.children(dir_one).filter(|&c| t.node(c).flags & flags::HARDLINK != 0).count();
+        let base_counted = t.node(find("base.dat")).flags & flags::HARDLINK == 0;
+        // the bytes are counted exactly once across base.dat + 200 links
+        assert_eq!(links + if base_counted { 0 } else { 1 }, 200);
+        let resident = find("f42.txt");
+        assert_eq!(t.node(resident).size, 3);
+        assert_eq!(t.node(resident).alloc, 0);
+        assert!(t.node(t.root).alloc < 8 << 20, "on-disk total must fit the 8 MB volume");
+        let bad = (0..t.nodes.len() as u32).find(|&i| t.name(i) == "$BadClus");
+        if let Some(b) = bad {
+            assert_eq!(t.node(b).alloc, 0);
+        }
+    }
+}

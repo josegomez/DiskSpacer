@@ -782,6 +782,7 @@ dependencies = [
  "crossbeam-channel",
  "eframe",
  "egui",
+ "flate2",
  "globset",
  "libc",
  "parking_lot 0.13.0",
