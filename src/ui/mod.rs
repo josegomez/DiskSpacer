@@ -43,6 +43,8 @@ enum Tab {
     Cleanup,
     Search,
     Largest,
+    Dupes,
+    Changes,
 }
 
 enum Action {
@@ -132,6 +134,16 @@ struct State {
     report: Option<Report>,
     now: i64,
     perf_overlay: bool,
+    dupes: Option<Vec<crate::dupes::Group>>,
+    dupes_job: Option<(Arc<crate::dupes::Progress>, crossbeam_channel::Receiver<Vec<crate::dupes::Group>>, Instant)>,
+    dupes_min: String,
+    history: Option<(String, Vec<(PathBuf, crate::snapshot::Meta)>)>,
+    changes: Option<(crate::snapshot::Meta, Vec<crate::snapshot::Change>)>,
+    changes_old: Option<Box<Tree>>,
+    changes_min: String,
+    changes_loading: Option<crossbeam_channel::Receiver<Result<(Tree, crate::snapshot::Meta), String>>>,
+    /// Viewing a saved scan (read-only).
+    viewing_saved: Option<crate::snapshot::Meta>,
     /// Remote Desktop mode: no hover dimming/animations/floating tooltips on charts.
     remote: bool,
     perf_hist: Vec<f32>,
@@ -252,6 +264,15 @@ impl App {
                 report: None,
                 now: chrono::Local::now().timestamp(),
                 perf_overlay: false,
+                dupes: None,
+                dupes_job: None,
+                dupes_min: "1 MB".into(),
+                history: None,
+                changes: None,
+                changes_old: None,
+                changes_min: "10 MB".into(),
+                changes_loading: None,
+                viewing_saved: None,
                 remote: platform::is_remote_session(),
                 perf_hist: Vec::new(),
                 perf_ui_ms: 0.0,
@@ -287,7 +308,28 @@ impl App {
         self.start_request(ScanRequest { path, prefer_mft: true, remote: None, conn: None }, ctx);
     }
 
+    fn open_saved(&mut self, path: PathBuf, ctx: &egui::Context) {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        let c = ctx.clone();
+        let p2 = path.clone();
+        std::thread::spawn(move || {
+            let msg = match crate::snapshot::load(&p2) {
+                Ok((t, meta)) => ScanMsg::Done(Box::new(t), Some(format!("📼 Viewing saved scan of {} from {} (read-only)", meta.label, fmt_date(meta.taken)))),
+                Err(e) => ScanMsg::Failed(format!("Can't open {}: {e}", p2.display())),
+            };
+            let _ = tx.send(msg);
+            c.request_repaint();
+        });
+        self.progress = Arc::new(Progress::default());
+        self.scan_started = Instant::now();
+        self.scanning = Some(path.clone());
+        self.scan_is_remote = false;
+        self.st.viewing_saved = crate::snapshot::read_meta(&path).ok();
+        self.scan_rx = Some(rx);
+    }
+
     fn start_request(&mut self, req: ScanRequest, ctx: &egui::Context) {
+        self.st.viewing_saved = None;
         self.progress = Arc::new(Progress::default());
         self.scan_started = Instant::now();
         let label = match (&req.remote, &req.conn) {
@@ -321,6 +363,15 @@ impl App {
                 st.tm = None;
                 st.strata = strata::StrataState::default();
                 st.cats = category::ext_categories(&t);
+                st.dupes = None;
+                st.dupes_job = None;
+                st.history = None;
+                st.changes = None;
+                st.changes_old = None;
+                if st.viewing_saved.is_none() && !t.name(t.root).starts_with("synthetic") {
+                    // automatic history for "what grew" comparisons (last 5 per location)
+                    crate::snapshot::autosave(crate::snapshot::encode(&t), crate::snapshot::label_of(&t), 5);
+                }
                 st.cat_cache = None;
                 st.highlight_cat = None;
                 st.largest = None;
@@ -536,6 +587,28 @@ impl App {
             if ui.add_enabled(!scanning, egui::Button::new("🌐 SSH…")).on_hover_text("Scan a remote Linux server over SSH").clicked() {
                 self.ssh_form = Some(self.last_ssh.clone().unwrap_or_default());
             }
+            ui.menu_button("💾", |ui| {
+                if ui.add_enabled(self.tree.is_some(), egui::Button::new("Save scan as…")).clicked() {
+                    if let Some(t) = &self.tree
+                        && let Some(p) = rfd::FileDialog::new().add_filter("SizeMatters scan", &["smscan"]).set_file_name("scan.smscan").save_file()
+                    {
+                        let bytes = crate::snapshot::encode(t);
+                        self.st.notice = Some(match crate::snapshot::write_compressed(&bytes, &p) {
+                            Ok(()) => (format!("Saved to {}", p.display()), OK),
+                            Err(e) => (format!("Save failed: {e}"), DANGER),
+                        });
+                    }
+                    ui.close();
+                }
+                if ui.button("Open saved scan…").clicked() {
+                    if let Some(p) = rfd::FileDialog::new().add_filter("SizeMatters scan", &["smscan"]).pick_file() {
+                        self.open_saved(p, ui.ctx());
+                    }
+                    ui.close();
+                }
+                ui.separator();
+                ui.label(RichText::new(format!("Scan history: {}", crate::snapshot::data_dir().join("scans").display())).weak().size(11.0));
+            });
             if let Some(t) = &self.tree
                 && ui.add_enabled(!scanning, egui::Button::new("⟳ Rescan")).clicked()
             {
@@ -1406,12 +1479,15 @@ fn treemap_view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
 
 fn side_panel(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
     ui.add_space(4.0);
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().item_spacing.x = 4.0;
         ui.selectable_value(&mut st.tab, Tab::Overview, "📊 Overview");
         ui.selectable_value(&mut st.tab, Tab::Cleanup, "🧹 Clean up");
         let sl = if st.search_results.is_empty() { "🔍 Search".to_string() } else { format!("🔍 Search ({})", fmt_count(st.search_results.len() as u64)) };
         ui.selectable_value(&mut st.tab, Tab::Search, sl);
         ui.selectable_value(&mut st.tab, Tab::Largest, "🏆 Largest");
+        ui.selectable_value(&mut st.tab, Tab::Dupes, "👯 Duplicates");
+        ui.selectable_value(&mut st.tab, Tab::Changes, "📈 Changes");
     });
     ui.separator();
 
@@ -1454,6 +1530,8 @@ fn side_panel(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
                 st.search_results = ids;
             }
         }
+        Tab::Dupes => dupes_tab(ui, t, st, acts),
+        Tab::Changes => changes_tab(ui, t, st, acts),
         Tab::Largest => {
             let key = (st.view_root, st.generation, st.use_alloc);
             if st.largest.as_ref().is_none_or(|c| c.0 != key) {
@@ -1466,6 +1544,225 @@ fn side_panel(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
             st.largest = Some((key, ids));
         }
     }
+}
+
+fn dupes_tab(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
+    if t.remote.is_some() {
+        ui.label(RichText::new("Duplicate search reads file contents, so it is available for local scans only.").weak());
+        return;
+    }
+    // poll background job
+    if let Some((_, rx, _)) = &st.dupes_job
+        && let Ok(mut groups) = rx.try_recv()
+    {
+        for g in groups.iter_mut() {
+            g.files.sort_by_key(|&i| std::cmp::Reverse(t.node(i).modified));
+        }
+        st.dupes = Some(groups);
+        st.dupes_job = None;
+    }
+    ui.label(RichText::new(format!("Find identical files in {}", short_name(t, st.view_root))).weak());
+    ui.horizontal(|ui| {
+        ui.label("Min size");
+        ui.add(egui::TextEdit::singleline(&mut st.dupes_min).desired_width(70.0));
+        let busy = st.dupes_job.is_some();
+        if ui.add_enabled(!busy, egui::Button::new(RichText::new("👯 Find duplicates").strong()).fill(Color32::from_rgb(40, 90, 170))).clicked() {
+            let min = filter::parse_size(&st.dupes_min).ok().flatten().unwrap_or(1 << 20);
+            let cands = crate::dupes::candidates(t, st.view_root, min);
+            let progress = Arc::new(crate::dupes::Progress::default());
+            let (tx, rx) = crossbeam_channel::bounded(1);
+            let (p2, ctx) = (progress.clone(), ui.ctx().clone());
+            std::thread::spawn(move || {
+                let g = crate::dupes::hash_groups(cands, &p2);
+                let _ = tx.send(g);
+                ctx.request_repaint();
+            });
+            st.dupes_job = Some((progress, rx, Instant::now()));
+            st.dupes = None;
+        }
+    });
+    if let Some((p, _, started)) = &st.dupes_job {
+        let (d, total) = (p.done.load(Ordering::Relaxed), p.total.load(Ordering::Relaxed).max(1));
+        let label = match p.stage.load(Ordering::Relaxed) {
+            3 => format!("comparing contents {} / {}", fmt_size(d), fmt_size(total)),
+            _ => format!("quick check {d} / {total} files"),
+        };
+        ui.add(egui::ProgressBar::new(d as f32 / total as f32).text(label));
+        ui.label(RichText::new(format!("{:.1}s", started.elapsed().as_secs_f32())).weak());
+        if ui.button("Cancel").clicked() {
+            p.cancel.store(true, Ordering::Relaxed);
+        }
+        ui.ctx().request_repaint_after(Duration::from_millis(150));
+        return;
+    }
+    let Some(groups) = &st.dupes else {
+        ui.label(RichText::new("Files are grouped by size first, then checked by a quick head/tail hash, then a full content hash — only likely duplicates are read.").weak().size(11.5));
+        return;
+    };
+    let live: Vec<&crate::dupes::Group> = groups.iter().filter(|g| g.files.iter().filter(|&&i| !t.node(i).is_deleted()).count() > 1).collect();
+    let wasted: u64 = live.iter().map(|g| g.size * (g.files.iter().filter(|&&i| !t.node(i).is_deleted()).count() as u64 - 1)).sum();
+    ui.label(RichText::new(format!("{} groups · {} reclaimable", fmt_count(live.len() as u64), fmt_size(wasted))).strong());
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Select all copies except the");
+        for (lbl, k) in [("newest", crate::dupes::Keep::Newest), ("oldest", crate::dupes::Keep::Oldest), ("shortest path", crate::dupes::Keep::ShortestPath)] {
+            if ui.small_button(lbl).clicked() {
+                let owned: Vec<crate::dupes::Group> = live.iter().map(|g| (*g).clone()).collect();
+                acts.push(Action::CheckMany(crate::dupes::auto_select(t, &owned, k), true));
+            }
+        }
+    });
+    ui.separator();
+    // flatten groups into rows: header + files
+    let mut rows: Vec<(Option<usize>, u32)> = Vec::new(); // (group idx for header, node)
+    for (gi, g) in live.iter().enumerate().take(2000) {
+        rows.push((Some(gi), NONE));
+        for &f in &g.files {
+            if !t.node(f).is_deleted() {
+                rows.push((None, f));
+            }
+        }
+    }
+    ui.spacing_mut().item_spacing.y = 0.0;
+    egui::ScrollArea::vertical().id_salt("dupes").auto_shrink([false, false]).show_rows(ui, 32.0, rows.len(), |ui, range| {
+        for &(hdr, f) in &rows[range] {
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 32.0), Sense::click());
+            let p = ui.painter_at(rect);
+            if let Some(gi) = hdr {
+                let g = live[gi];
+                let n = g.files.iter().filter(|&&i| !t.node(i).is_deleted()).count();
+                p.rect_filled(rect.shrink2(vec2(0.0, 2.0)), 4.0, Color32::from_rgb(36, 40, 52));
+                p.text(pos2(rect.left() + 8.0, rect.center().y), Align2::LEFT_CENTER, format!("{n} × {}   ·   {} wasted", fmt_size(g.size), fmt_size(g.size * (n as u64 - 1))), FontId::proportional(12.0), Color32::from_gray(210));
+                continue;
+            }
+            let checked = st.checked.contains(&f);
+            if resp.hovered() {
+                p.rect_filled(rect, 3.0, Color32::from_rgb(38, 42, 52));
+            }
+            let cb = egui::Rect::from_center_size(pos2(rect.left() + 18.0, rect.center().y), vec2(13.0, 13.0));
+            p.rect(cb, 3.0, if checked { ACCENT } else { Color32::from_rgb(30, 33, 40) }, Stroke::new(1.0, Color32::from_gray(120)), StrokeKind::Inside);
+            if checked {
+                p.text(cb.center(), Align2::CENTER_CENTER, "✔", FontId::proportional(10.0), Color32::WHITE);
+            }
+            let clip = p.with_clip_rect(egui::Rect::from_min_max(rect.min, pos2(rect.right() - 110.0, rect.bottom())));
+            clip.text(pos2(rect.left() + 32.0, rect.top() + 3.0), Align2::LEFT_TOP, t.name(f), FontId::proportional(12.5), if checked { Color32::from_rgb(255, 170, 150) } else { Color32::from_gray(225) });
+            // folder relative to the current view
+            let base = t.path(st.view_root);
+            let full = t.path(t.node(f).parent);
+            let rel = full.strip_prefix(&base).unwrap_or(&full).trim_start_matches(['\\', '/']);
+            clip.text(pos2(rect.left() + 32.0, rect.bottom() - 3.0), Align2::LEFT_BOTTOM, if rel.is_empty() { "." } else { rel }, FontId::proportional(10.5), Color32::from_gray(130));
+            p.text(pos2(rect.right() - 4.0, rect.center().y), Align2::RIGHT_CENTER, fmt_date(t.node(f).modified), FontId::proportional(11.0), Color32::from_gray(140));
+            if resp.clicked() {
+                acts.push(Action::Check(f, !checked));
+            }
+            resp.context_menu(|ui| node_menu(ui, t, st, f, acts));
+        }
+    });
+}
+
+fn changes_tab(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
+    if st.viewing_saved.is_some() {
+        ui.label(RichText::new("You are viewing a saved scan. Rescan the location to compare it with history.").weak());
+        return;
+    }
+    let label = crate::snapshot::label_of(t);
+    if st.history.as_ref().is_none_or(|h| h.0 != label) {
+        st.history = Some((label.clone(), crate::snapshot::history(&label)));
+    }
+    // poll loading
+    if let Some(rx) = &st.changes_loading
+        && let Ok(res) = rx.try_recv()
+    {
+        st.changes_loading = None;
+        match res {
+            Ok((old, meta)) => {
+                let min = filter::parse_size(&st.changes_min).ok().flatten().unwrap_or(10 << 20);
+                let ch = crate::snapshot::grew(&old, t, min, 2000);
+                st.changes = Some((meta, ch));
+                st.changes_old = Some(Box::new(old));
+            }
+            Err(e) => st.notice = Some((e, DANGER)),
+        }
+    }
+    ui.label(RichText::new("What grew since an earlier scan of this location? Every scan is kept automatically (last 5).").weak().size(11.5));
+    let hist = st.history.as_ref().unwrap().1.clone();
+    // only scans taken before the current one (the current scan is saved too)
+    let earlier: Vec<&(PathBuf, crate::snapshot::Meta)> = hist.iter().filter(|(_, m)| m.taken < st.now).collect();
+    ui.horizontal_wrapped(|ui| {
+        ui.label("Min change");
+        if ui.add(egui::TextEdit::singleline(&mut st.changes_min).desired_width(70.0)).lost_focus()
+            && let Some(old) = &st.changes_old
+        {
+            let min = filter::parse_size(&st.changes_min).ok().flatten().unwrap_or(10 << 20);
+            let meta = st.changes.as_ref().map(|c| c.0.clone());
+            if let Some(meta) = meta {
+                st.changes = Some((meta, crate::snapshot::grew(old, t, min, 2000)));
+            }
+        }
+        if ui.button("Compare with a file…").clicked()
+            && let Some(p) = rfd::FileDialog::new().add_filter("SizeMatters scan", &["smscan"]).pick_file()
+        {
+            st.changes_loading = Some(load_async(p, ui.ctx()));
+        }
+    });
+    if earlier.is_empty() {
+        ui.label(RichText::new("No earlier scans of this location yet — scan it again later (or open a saved scan) to see what changed.").weak());
+    } else {
+        ui.label("Compare with:");
+        for (p, m) in earlier.iter().take(4) {
+            if ui.button(format!("{}  ·  {} files  ·  {}", fmt_date(m.taken), fmt_count(m.files), fmt_size(m.alloc))).clicked() {
+                st.changes_loading = Some(load_async(p.clone(), ui.ctx()));
+            }
+        }
+    }
+    if st.changes_loading.is_some() {
+        ui.horizontal(|ui| {
+            ui.spinner();
+            ui.label("Loading earlier scan…");
+        });
+        ui.ctx().request_repaint_after(Duration::from_millis(150));
+    }
+    ui.separator();
+    let Some((meta, ch)) = &st.changes else { return };
+    let grown: i64 = ch.iter().filter(|c| c.now.is_some_and(|n| t.node(n).parent == t.root) || c.now.is_none() && c.path.matches(t.sep).count() <= 1).map(|c| c.delta()).sum();
+    let total_delta = t.node(t.root).alloc as i64 - meta.alloc as i64;
+    ui.label(RichText::new(format!("Since {}: {}{} overall", fmt_date(meta.taken), if total_delta >= 0 { "+" } else { "−" }, fmt_size(total_delta.unsigned_abs()))).strong());
+    let _ = grown;
+    ui.spacing_mut().item_spacing.y = 0.0;
+    let ch = ch.clone();
+    egui::ScrollArea::vertical().id_salt("changes").auto_shrink([false, false]).show_rows(ui, 34.0, ch.len(), |ui, range| {
+        for c in &ch[range] {
+            let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 34.0), Sense::click());
+            let p = ui.painter_at(rect);
+            if resp.hovered() {
+                p.rect_filled(rect, 3.0, Color32::from_rgb(38, 42, 52));
+            }
+            let d = c.delta();
+            let (col, sign) = if d >= 0 { (Color32::from_rgb(255, 150, 120), "+") } else { (OK, "−") };
+            let tag = if c.before == 0 { "new" } else if c.after == 0 { "removed" } else { "" };
+            let clip = p.with_clip_rect(egui::Rect::from_min_max(rect.min, pos2(rect.right() - 100.0, rect.bottom())));
+            let root_path = t.name(t.root);
+            let shown = c.path.strip_prefix(root_path).unwrap_or(&c.path).trim_start_matches(['\\', '/']);
+            clip.text(pos2(rect.left() + 6.0, rect.top() + 4.0), Align2::LEFT_TOP, format!("{}{}", if c.is_dir { "📁 " } else { "" }, shown), FontId::proportional(12.5), Color32::from_gray(225));
+            clip.text(pos2(rect.left() + 6.0, rect.bottom() - 4.0), Align2::LEFT_BOTTOM, format!("{} → {}  {tag}", fmt_size(c.before), fmt_size(c.after)), FontId::proportional(10.5), Color32::from_gray(140));
+            p.text(pos2(rect.right() - 6.0, rect.center().y), Align2::RIGHT_CENTER, format!("{sign}{}", fmt_size(d.unsigned_abs())), FontId::monospace(12.5), col);
+            if resp.clicked()
+                && let Some(n) = c.now
+                && !t.node(n).is_deleted()
+            {
+                acts.push(Action::Select(n));
+            }
+        }
+    });
+}
+
+fn load_async(p: PathBuf, ctx: &egui::Context) -> crossbeam_channel::Receiver<Result<(Tree, crate::snapshot::Meta), String>> {
+    let (tx, rx) = crossbeam_channel::bounded(1);
+    let ctx = ctx.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(crate::snapshot::load(&p).map_err(|e| e.to_string()));
+        ctx.request_repaint();
+    });
+    rx
 }
 
 fn overview(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
@@ -1977,6 +2274,9 @@ impl App {
                         st.expanded.insert(i);
                     }
                     st.rows_dirty = true;
+                }
+                Action::Delete(_, _) if st.viewing_saved.is_some() => {
+                    st.notice = Some(("This is a saved scan (read-only). Rescan the location to delete files.".into(), WARN));
                 }
                 Action::Delete(ids, m) => {
                     let m = if t.remote.is_some() { Method::Permanent } else { m };
