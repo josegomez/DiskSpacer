@@ -727,22 +727,14 @@ fn tree_row(ui: &mut Ui, t: &Tree, st: &State, i: u32, depth: u16, ri: usize, co
     let mut arrow_hit = false;
     if has_kids {
         let ar = egui::Rect::from_center_size(pos2(x0 + 6.0, cy), vec2(14.0, ROW_H));
-        let txt = if expanded { "⏷" } else { "⏵" };
-        p.text(ar.center(), Align2::CENTER_CENTER, txt, FontId::proportional(12.0), Color32::from_gray(170));
+        draw_arrow(&p, ar.center(), expanded, Color32::from_gray(170));
         if resp.clicked() && ui.input(|inp| inp.pointer.interact_pos()).is_some_and(|pp| ar.contains(pp)) {
             arrow_hit = true;
             acts.push(Action::Toggle(i));
         }
     }
-    let icon = if n.flags & flags::REPARSE != 0 {
-        "🔗"
-    } else if is_dir {
-        "📁"
-    } else {
-        "🗋"
-    };
     let icon_col = if is_dir { Color32::from_rgb(240, 196, 90) } else { st.ext_colors.get(n.ext as usize).copied().unwrap_or(Color32::GRAY) };
-    p.text(pos2(x0 + 14.0, cy), Align2::LEFT_CENTER, icon, FontId::proportional(13.0), icon_col);
+    draw_icon(&p, pos2(x0 + 22.0, cy), is_dir, n.flags & flags::REPARSE != 0, icon_col);
     let name_max = (rect.left() + cols.bar_x - 8.0) - (x0 + 32.0);
     let mut name = t.name(i).to_string();
     let name_col = if n.flags & (flags::HIDDEN | flags::SYSTEM | flags::METAFILE) != 0 { Color32::from_gray(150) } else { Color32::from_gray(230) };
@@ -768,8 +760,12 @@ fn tree_row(ui: &mut Ui, t: &Tree, st: &State, i: u32, depth: u16, ri: usize, co
     let hue = 0.6 - 0.6 * frac.sqrt();
     p.rect_filled(egui::Rect::from_min_size(bar.min, vec2(cols.bar_w * frac, 12.0)), 3.0, theme::hsv(hue, 0.6, 0.85));
     let pct = format!("{:.1}%", frac * 100.0);
-    p.text(bar.center() + vec2(0.8, 0.8), Align2::CENTER_CENTER, &pct, FontId::proportional(10.5), Color32::from_black_alpha(220));
-    p.text(bar.center(), Align2::CENTER_CENTER, pct, FontId::proportional(10.5), Color32::WHITE);
+    // Dark text where the (light) fill is behind the label, white over the dark track.
+    if frac > 0.5 {
+        p.text(bar.center(), Align2::CENTER_CENTER, pct, FontId::proportional(10.5), Color32::from_rgb(16, 18, 22));
+    } else {
+        p.text(bar.center(), Align2::CENTER_CENTER, pct, FontId::proportional(10.5), Color32::from_gray(235));
+    }
     p.text(pos2(rect.left() + cols.size_x + cols.size_w, cy), Align2::RIGHT_CENTER, fmt_size(n_metric(t, i, st.use_alloc)), FontId::monospace(12.0), Color32::from_gray(225));
     if cols.files_w > 0.0 {
         p.text(pos2(rect.left() + cols.files_x + cols.files_w, cy), Align2::RIGHT_CENTER, if is_dir { fmt_count(n.files as u64) } else { String::new() }, FontId::monospace(11.5), Color32::from_gray(160));
@@ -808,6 +804,41 @@ fn elide(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(max_chars - 1).collect();
     out.push('…');
     out
+}
+
+/// Expand/collapse triangle, drawn as a shape (no font glyph needed).
+fn draw_arrow(p: &egui::Painter, c: Pos2, expanded: bool, col: Color32) {
+    let pts = if expanded {
+        vec![c + vec2(-4.0, -2.0), c + vec2(4.0, -2.0), c + vec2(0.0, 3.0)]
+    } else {
+        vec![c + vec2(-2.0, -4.0), c + vec2(3.0, 0.0), c + vec2(-2.0, 4.0)]
+    };
+    p.add(egui::Shape::convex_polygon(pts, col, Stroke::NONE));
+}
+
+/// Folder / file / link icon drawn with shapes, so it renders with any font.
+fn draw_icon(p: &egui::Painter, c: Pos2, is_dir: bool, is_link: bool, col: Color32) {
+    if is_dir {
+        let body = egui::Rect::from_center_size(c + vec2(0.0, 1.0), vec2(14.0, 9.0));
+        let tab = egui::Rect::from_min_size(body.left_top() + vec2(0.0, -2.5), vec2(6.0, 3.0));
+        if is_link {
+            p.rect_stroke(body, 1.5, Stroke::new(1.2, col), StrokeKind::Inside);
+            p.rect_stroke(tab, 1.0, Stroke::new(1.2, col), StrokeKind::Inside);
+        } else {
+            p.rect_filled(tab, 1.0, col.gamma_multiply(0.8));
+            p.rect_filled(body, 1.5, col);
+        }
+    } else {
+        let page = egui::Rect::from_center_size(c, vec2(9.0, 12.0));
+        if is_link {
+            p.rect_stroke(page, 1.0, Stroke::new(1.2, col), StrokeKind::Inside);
+        } else {
+            p.rect_filled(page, 1.5, col);
+            // folded corner
+            let tr = page.right_top();
+            p.add(egui::Shape::convex_polygon(vec![tr + vec2(-3.5, 0.0), tr, tr + vec2(0.0, 3.5)], Color32::from_rgb(24, 26, 32), Stroke::NONE));
+        }
+    }
 }
 
 #[inline]

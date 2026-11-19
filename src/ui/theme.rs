@@ -45,8 +45,12 @@ pub fn apply(ctx: &egui::Context) {
     v.widgets.inactive.weak_bg_fill = Color32::from_rgb(40, 44, 54);
     v.widgets.hovered.weak_bg_fill = Color32::from_rgb(52, 58, 72);
     v.striped = true;
-    ctx.set_visuals(v);
-    ctx.global_style_mut(|s| {
+    // Always dark: the custom-painted views assume a dark background, and following a
+    // light Windows theme made text unreadable.
+    ctx.set_theme(egui::ThemePreference::Dark);
+    ctx.set_visuals_of(egui::Theme::Dark, v.clone());
+    ctx.set_visuals_of(egui::Theme::Light, v);
+    ctx.all_styles_mut(|s| {
         s.spacing.item_spacing = egui::vec2(8.0, 6.0);
         s.spacing.button_padding = egui::vec2(10.0, 5.0);
         s.spacing.interact_size.y = 24.0;
