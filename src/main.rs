@@ -8,6 +8,7 @@ mod filter;
 mod model;
 mod platform;
 mod scan;
+mod swrender;
 mod ui;
 mod util;
 
@@ -21,7 +22,7 @@ fn main() -> eframe::Result {
         }
         std::process::exit(cli::run(&args[1..]));
     }
-    let initial = args.first().filter(|a| !a.starts_with('-')).map(std::path::PathBuf::from);
+    let initial = args.iter().find(|a| !a.starts_with('-')).map(std::path::PathBuf::from);
 
     let force_gl = args.iter().any(|a| a == "--opengl") || std::env::var_os("DISKSPACER_OPENGL").is_some();
     let make = |renderer: eframe::Renderer| {
@@ -50,8 +51,17 @@ fn main() -> eframe::Result {
     };
     let run = |renderer: eframe::Renderer| {
         let initial = initial.clone();
-        eframe::run_native("DiskSpacer", make(renderer), Box::new(move |cc| Ok(Box::new(ui::App::new(cc, initial)))))
+        eframe::run_native("DiskSpacer", make(renderer), Box::new(move |cc| Ok(Box::new(ui::App::new(&cc.egui_ctx, initial)))))
     };
+    // Remote Desktop: CPU renderer that sends only changed tiles (see swrender.rs).
+    let software = args.iter().any(|a| a == "--software")
+        || (platform::is_remote_session() && !args.iter().any(|a| a == "--gpu"));
+    if software {
+        if let Err(e) = swrender::run(initial.clone()) {
+            fatal(&format!("Software renderer: {e}"));
+        }
+        return Ok(());
+    }
     if force_gl {
         if let Err(e) = run(eframe::Renderer::Glow) {
             fatal(&format!("OpenGL: {e}\n\nOpenGL is often unavailable over Remote Desktop; use the normal launch there."));

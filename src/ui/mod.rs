@@ -40,7 +40,8 @@ enum Tab {
 
 enum Action {
     Select(u32),
-    SelectQuiet(u32),
+    /// Selection from the tree list: the chart follows (zooms to the folder).
+    TreeSelect(u32),
     Zoom(u32),
     ZoomOut,
     Toggle(u32),
@@ -141,8 +142,8 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>, initial: Option<PathBuf>) -> Self {
-        theme::apply(&cc.egui_ctx);
+    pub fn new(ctx: &egui::Context, initial: Option<PathBuf>) -> Self {
+        theme::apply(ctx);
         let drives = platform::list_drives();
         let mut app = App {
             tree: None,
@@ -200,7 +201,7 @@ impl App {
             scanning: None,
         };
         if let Some(p) = initial {
-            app.start_scan(p, &cc.egui_ctx);
+            app.start_scan(p, ctx);
         }
         app
     }
@@ -300,15 +301,22 @@ impl App {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut Ui, frame: &mut eframe::Frame) {
+        self.frame(ui, frame.info().cpu_usage);
+    }
+}
+
+impl App {
+    /// One UI frame. Called by eframe (GPU) or by the software renderer.
+    pub fn frame(&mut self, ui: &mut Ui, cpu_usage: Option<f32>) {
         let frame_start = Instant::now();
-        let _log = FrameLog(frame_start, frame.info().cpu_usage);
+        let _log = FrameLog(frame_start, cpu_usage);
         let ctx = ui.ctx().clone();
         if ctx.input(|i| i.key_pressed(Key::F12)) {
             self.st.perf_overlay = !self.st.perf_overlay;
         }
         self.st.perf_ui_ms = f32::from_bits(LAST_UI_MS.load(Ordering::Relaxed));
         if self.st.perf_overlay {
-            let full = frame.info().cpu_usage.unwrap_or(0.0) * 1000.0;
+            let full = cpu_usage.unwrap_or(0.0) * 1000.0;
             self.st.perf_hist.push(full);
             if self.st.perf_hist.len() > 120 {
                 self.st.perf_hist.remove(0);
@@ -630,10 +638,10 @@ fn handle_keys(ctx: &egui::Context, t: &Tree, st: &mut State, acts: &mut Vec<Act
             let idx = st.rows.iter().position(|r| r.0 == s);
             if let Some(idx) = idx {
                 if i.key_pressed(Key::ArrowDown) && idx + 1 < st.rows.len() {
-                    acts.push(Action::Select(st.rows[idx + 1].0));
+                    acts.push(Action::TreeSelect(st.rows[idx + 1].0));
                 }
                 if i.key_pressed(Key::ArrowUp) && !i.modifiers.alt && idx > 0 {
-                    acts.push(Action::Select(st.rows[idx - 1].0));
+                    acts.push(Action::TreeSelect(st.rows[idx - 1].0));
                 }
                 if i.key_pressed(Key::ArrowRight) && t.node(s).is_dir() && !st.expanded.contains(&s) {
                     acts.push(Action::Toggle(s));
@@ -642,7 +650,7 @@ fn handle_keys(ctx: &egui::Context, t: &Tree, st: &mut State, acts: &mut Vec<Act
                     if st.expanded.contains(&s) {
                         acts.push(Action::Toggle(s));
                     } else if s != t.root {
-                        acts.push(Action::Select(t.node(s).parent));
+                        acts.push(Action::TreeSelect(t.node(s).parent));
                     }
                 }
             }
@@ -824,7 +832,7 @@ fn tree_row(ui: &mut Ui, t: &Tree, st: &State, i: u32, depth: u16, ri: usize, co
     }
 
     if resp.clicked() && !arrow_hit {
-        acts.push(Action::SelectQuiet(i));
+        acts.push(Action::TreeSelect(i));
     }
     if resp.double_clicked() && is_dir {
         acts.push(Action::Zoom(i));
@@ -1671,10 +1679,18 @@ impl App {
         let st = &mut self.st;
         for a in acts {
             match a {
-                Action::Select(i) | Action::SelectQuiet(i) => {
-                    let quiet = matches!(a, Action::SelectQuiet(_));
+                Action::TreeSelect(i) => {
                     st.selected = Some(i);
-                    if !quiet {
+                    // the chart follows: show the folder itself, or the folder holding the file
+                    let target = if t.node(i).is_dir() { i } else { t.node(i).parent };
+                    if target != NONE {
+                        st.view_root = target;
+                    }
+                    st.scroll_to_selected = true;
+                }
+                Action::Select(i) => {
+                    st.selected = Some(i);
+                    {
                         // reveal in tree
                         let chain = t.ancestry(i);
                         let mut changed = false;
