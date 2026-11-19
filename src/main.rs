@@ -23,12 +23,38 @@ fn main() -> eframe::Result {
     }
     let initial = args.first().filter(|a| !a.starts_with('-')).map(std::path::PathBuf::from);
 
-    let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_title("DiskSpacer")
-            .with_inner_size([1480.0, 900.0])
-            .with_min_inner_size([900.0, 560.0]),
-        ..Default::default()
+    let force_gl = args.iter().any(|a| a == "--opengl") || std::env::var_os("DISKSPACER_OPENGL").is_some();
+    let make = |renderer: eframe::Renderer| {
+        #[cfg_attr(not(windows), allow(unused_mut))]
+        let mut o = eframe::NativeOptions {
+            viewport: egui::ViewportBuilder::default()
+                .with_title("DiskSpacer")
+                .with_inner_size([1480.0, 900.0])
+                .with_min_inner_size([900.0, 560.0]),
+            renderer,
+            ..Default::default()
+        };
+        // Never touch Vulkan on Windows: some Intel/older drivers crash while merely
+        // enumerating Vulkan adapters (igvk64.dll access violation). DirectX 12 only.
+        #[cfg(windows)]
+        if let eframe::egui_wgpu::WgpuSetup::CreateNew(c) = &mut o.wgpu_options.wgpu_setup {
+            c.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
+        }
+        o
     };
-    eframe::run_native("DiskSpacer", options, Box::new(move |cc| Ok(Box::new(ui::App::new(cc, initial)))))
+    let run = |renderer: eframe::Renderer| {
+        let initial = initial.clone();
+        eframe::run_native("DiskSpacer", make(renderer), Box::new(move |cc| Ok(Box::new(ui::App::new(cc, initial)))))
+    };
+    if force_gl {
+        return run(eframe::Renderer::Glow);
+    }
+    match run(eframe::Renderer::Wgpu) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            // No usable DirectX 12 adapter: fall back to OpenGL.
+            eprintln!("GPU renderer failed ({e}); retrying with OpenGL");
+            run(eframe::Renderer::Glow)
+        }
+    }
 }

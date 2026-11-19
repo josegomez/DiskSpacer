@@ -7,7 +7,7 @@ edition = "2024"
 anyhow = "1.0.104"
 chrono = "0.4.45"
 crossbeam-channel = "0.5.17"
-eframe = "0.37.0"
+eframe = { version = "0.37.0", features = ["glow"] }
 egui = "0.37.0"
 globset = "0.4.21"
 parking_lot = "0.13.0"
