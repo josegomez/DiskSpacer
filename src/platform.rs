@@ -97,6 +97,12 @@ mod imp {
         out
     }
 
+    /// Running inside a Remote Desktop session?
+    pub fn is_remote_session() -> bool {
+        // SM_REMOTESESSION
+        unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetSystemMetrics(0x1000) != 0 }
+    }
+
     pub fn is_elevated() -> bool {
         unsafe {
             let mut token: HANDLE = std::ptr::null_mut();
@@ -170,6 +176,10 @@ mod imp {
             v.push(DriveInfo { root, label: String::new(), fs: String::new(), total, free });
         }
         v
+    }
+
+    pub fn is_remote_session() -> bool {
+        std::env::var_os("DISKSPACER_REMOTE").is_some()
     }
 
     pub fn is_elevated() -> bool {

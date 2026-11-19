@@ -135,6 +135,7 @@ struct Paint<'a> {
     hue_depth: u32,
     hovered_prev: Option<u32>,
     hit: Option<(u32, bool, u32)>, // (node or parent, is_aggregate, aggregated count)
+    hit_rect: Option<Rect>,
     pointer: Option<Pos2>,
     shapes: Vec<egui::Shape>,
     labels: Vec<(Rect, String, String, Color32, bool)>,
@@ -238,6 +239,7 @@ impl Paint<'_> {
                 && self.area.contains(p)
             {
                 self.hit = Some((node, false, 0));
+                self.hit_rect = Some(r);
             }
             if r.width() >= 26.0 && r.intersects(self.area) {
                 let t = self.t;
@@ -369,7 +371,9 @@ pub fn view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
         if let Some(prev) = ss.shown
             && ss.target_root != st.view_root
         {
-            ss.anim = Some(Anim { from: prev, start: Instant::now() });
+            if !st.remote {
+                ss.anim = Some(Anim { from: prev, start: Instant::now() });
+            }
         }
         ss.target_root = st.view_root;
     }
@@ -412,8 +416,9 @@ pub fn view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
                 }
             }
         },
-        hovered_prev: st.hovered,
+        hovered_prev: if st.remote { None } else { st.hovered },
         hit: None,
+        hit_rect: None,
         pointer: resp.hover_pos(),
         shapes: Vec::with_capacity(4096),
         labels: Vec::new(),
@@ -445,7 +450,7 @@ pub fn view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
             }
         }
     }
-    let Paint { shapes, labels, hit, .. } = p;
+    let Paint { shapes, labels, hit, hit_rect, .. } = p;
     painter.with_clip_rect(area).extend(shapes);
 
     // labels (clipped per block, measured with the real font)
@@ -473,6 +478,13 @@ pub fn view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
         }
     }
 
+    // Remote mode: a thin outline is the only hover feedback (tiny screen update).
+    if st.remote
+        && let Some(r) = hit_rect
+    {
+        painter.with_clip_rect(area).rect_stroke(r, 5.0, Stroke::new(1.5, Color32::from_white_alpha(220)), StrokeKind::Inside);
+    }
+
     // selection outline
     if let Some(sel) = st.selected
         && sel != NONE
@@ -493,11 +505,12 @@ pub fn view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
     if resp.clicked_by(egui::PointerButton::Extra1) {
         acts.push(Action::ZoomOut);
     }
+    let prev_hover = st.hovered;
     st.hovered = None;
     if let Some((node, is_agg, count)) = hit {
         if !is_agg {
             st.hovered = Some(node);
-            let resp = resp.clone().on_hover_ui_at_pointer(|ui| node_tooltip(ui, t, node));
+            let resp = if st.remote { resp.clone() } else { resp.clone().on_hover_ui_at_pointer(|ui| node_tooltip(ui, t, node)) };
             if resp.clicked() {
                 acts.push(Action::Select(node));
             }
@@ -522,6 +535,9 @@ pub fn view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
         acts.push(Action::ZoomOut);
     }
     chart_context_menu(&resp, t, st, acts);
+    if st.hovered != prev_hover {
+        ui.ctx().request_repaint(); // the info bar above was drawn with last frame's hover
+    }
 }
 
 /// Longest prefix of `s` (with an ellipsis) that fits in `max_w` points.

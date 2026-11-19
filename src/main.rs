@@ -37,6 +37,11 @@ fn main() -> eframe::Result {
         // enumerating Vulkan adapters (igvk64.dll access violation). DirectX 12 only.
         // One queued frame instead of two: clicks and hovers feel immediate.
         o.wgpu_options.surface = eframe::egui_wgpu::SurfaceConfig::LOW_LATENCY;
+        if platform::is_remote_session() {
+            // Over Remote Desktop, waiting for vsync queues frames behind the remote
+            // compositor's slow refresh, so hover feedback trails the mouse. Present now.
+            o.wgpu_options.surface.present_mode = eframe::wgpu::PresentMode::AutoNoVsync;
+        }
         #[cfg(windows)]
         if let eframe::egui_wgpu::WgpuSetup::CreateNew(c) = &mut o.wgpu_options.wgpu_setup {
             c.instance_descriptor.backends = eframe::wgpu::Backends::DX12;
@@ -48,14 +53,31 @@ fn main() -> eframe::Result {
         eframe::run_native("DiskSpacer", make(renderer), Box::new(move |cc| Ok(Box::new(ui::App::new(cc, initial)))))
     };
     if force_gl {
-        return run(eframe::Renderer::Glow);
+        if let Err(e) = run(eframe::Renderer::Glow) {
+            fatal(&format!("OpenGL: {e}\n\nOpenGL is often unavailable over Remote Desktop; use the normal launch there."));
+        }
+        return Ok(());
     }
-    match run(eframe::Renderer::Wgpu) {
+    let result = match run(eframe::Renderer::Wgpu) {
         Ok(()) => Ok(()),
         Err(e) => {
             // No usable DirectX 12 adapter: fall back to OpenGL.
             eprintln!("GPU renderer failed ({e}); retrying with OpenGL");
-            run(eframe::Renderer::Glow)
+            run(eframe::Renderer::Glow).map_err(|e2| (e, Some(e2)))
         }
     }
+    .map_err(|(e, e2)| format!("DirectX 12: {e}{}", e2.map(|x| format!("\nOpenGL: {x}")).unwrap_or_default()));
+    if let Err(msg) = &result {
+        fatal(msg);
+    }
+    Ok(())
+}
+
+/// Show a startup error instead of silently exiting (release builds have no console).
+fn fatal(msg: &str) {
+    let _ = rfd::MessageDialog::new()
+        .set_title("DiskSpacer could not start")
+        .set_description(format!("The graphics renderer failed to start.\n\n{msg}\n\nTry the other launch mode, or update your graphics driver."))
+        .set_level(rfd::MessageLevel::Error)
+        .show();
 }

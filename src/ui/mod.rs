@@ -124,6 +124,8 @@ struct State {
     report: Option<Report>,
     now: i64,
     perf_overlay: bool,
+    /// Remote Desktop mode: no hover dimming/animations/floating tooltips on charts.
+    remote: bool,
     perf_hist: Vec<f32>,
     perf_ui_ms: f32,
     ext_order: Option<((u64, bool), Vec<usize>)>,
@@ -187,6 +189,7 @@ impl App {
                 report: None,
                 now: chrono::Local::now().timestamp(),
                 perf_overlay: false,
+                remote: platform::is_remote_session(),
                 perf_hist: Vec::new(),
                 perf_ui_ms: 0.0,
                 ext_order: None,
@@ -472,6 +475,10 @@ impl App {
                 ui.label(format!("scanned in {:.2}s", t.scan_ms as f64 / 1000.0));
             }
             ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+                ui.toggle_value(&mut self.st.remote, "🖥 Remote mode").on_hover_text(
+                    "Lighter visuals for Remote Desktop: no hover dimming, animations or floating tooltips on the charts.\nTurned on automatically in RDP sessions.",
+                );
+                ui.separator();
                 if self.st.elevated {
                     ui.label(RichText::new("🛡 Administrator").color(OK));
                 } else if cfg!(windows) {
@@ -822,7 +829,7 @@ fn tree_row(ui: &mut Ui, t: &Tree, st: &State, i: u32, depth: u16, ri: usize, co
     if resp.double_clicked() && is_dir {
         acts.push(Action::Zoom(i));
     }
-    let resp = resp.on_hover_ui_at_pointer(|ui| node_tooltip(ui, t, i));
+    let resp = hover_tip(resp, st.remote, |ui| node_tooltip(ui, t, i));
     resp.context_menu(|ui| node_menu(ui, t, st, i, acts));
 }
 
@@ -846,6 +853,30 @@ fn elide(s: &str, max_chars: usize) -> String {
     let mut out: String = s.chars().take(max_chars - 1).collect();
     out.push('…');
     out
+}
+
+/// Tooltip that follows the pointer locally, but stays anchored over Remote Desktop
+/// (a moving tooltip forces large screen updates on every mouse move).
+fn hover_tip(resp: egui::Response, remote: bool, f: impl FnOnce(&mut Ui)) -> egui::Response {
+    if remote { resp.on_hover_ui(f) } else { resp.on_hover_ui_at_pointer(f) }
+}
+
+/// One-line details for the hovered (or selected) item, under the chart.
+fn info_bar(ui: &mut Ui, t: &Tree, st: &State) {
+    let Some(i) = st.hovered.or(st.selected).filter(|&i| !t.node(i).is_deleted()) else {
+        ui.label(RichText::new("Hover a block for details · double-click to zoom · right-click for actions").weak().size(11.5));
+        return;
+    };
+    let n = t.node(i);
+    ui.horizontal(|ui| {
+        ui.add(egui::Label::new(RichText::new(t.path(i)).strong().size(12.0)).truncate());
+    });
+    let mut s = format!("{} on disk · {} size", fmt_size(n.alloc), fmt_size(n.size));
+    if n.is_dir() {
+        s += &format!(" · {} files, {} folders", fmt_count(n.files as u64), fmt_count(n.dirs as u64));
+    }
+    s += &format!(" · modified {}", fmt_date(n.modified));
+    ui.label(RichText::new(s).size(11.5).color(Color32::from_gray(170)));
 }
 
 /// Right-click menu for the chart views. The target is remembered in `st.menu_node`
@@ -1021,6 +1052,7 @@ fn center_view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
     ui.add_space(4.0);
     category_bar(ui, t, st);
     ui.add_space(8.0);
+    egui::Panel::bottom("hover_info").frame(egui::Frame::new().inner_margin(egui::Margin::symmetric(2, 4))).show(ui, |ui| info_bar(ui, t, st));
     match st.view {
         View::Strata => strata::view(ui, t, st, acts),
         View::Treemap => treemap_view(ui, t, st, acts),
@@ -1191,6 +1223,7 @@ fn treemap_view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
         painter.rect_stroke(to_screen(&c.rect).shrink(2.5), 0.0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Inside);
     }
 
+    let prev_hover = st.hovered;
     st.hovered = None;
     if let Some(pos) = resp.hover_pos() {
         let (x, y) = ((pos.x - rect.left()) * ppp, (pos.y - rect.top()) * ppp);
@@ -1204,7 +1237,8 @@ fn treemap_view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
             if let Some(pc) = cache.layout.cells.iter().find(|c| c.node == parent && parent != st.view_root) {
                 painter.rect_stroke(to_screen(&pc.rect), 0.0, Stroke::new(1.0, ACCENT), StrokeKind::Inside);
             }
-            let resp = resp.clone().on_hover_ui_at_pointer(|ui| node_tooltip(ui, t, node));
+            // Remote mode: details go to the info bar instead of a tooltip chasing the mouse.
+            let resp = if st.remote { resp.clone() } else { resp.clone().on_hover_ui_at_pointer(|ui| node_tooltip(ui, t, node)) };
             if resp.clicked() {
                 acts.push(Action::Select(node));
             }
@@ -1221,6 +1255,9 @@ fn treemap_view(ui: &mut Ui, t: &Tree, st: &mut State, acts: &mut Vec<Action>) {
         }
     }
     chart_context_menu(&resp, t, st, acts);
+    if st.hovered != prev_hover {
+        ui.ctx().request_repaint();
+    }
     if resp.clicked_by(egui::PointerButton::Extra1) {
         acts.push(Action::ZoomOut);
     }
@@ -1580,7 +1617,7 @@ fn results_table(ui: &mut Ui, t: &Tree, st: &State, ids: &[u32], salt: &str, act
             if resp.double_clicked() {
                 acts.push(Action::Check(i, !checked));
             }
-            let resp = resp.on_hover_ui_at_pointer(|ui| node_tooltip(ui, t, i));
+            let resp = hover_tip(resp, st.remote, |ui| node_tooltip(ui, t, i));
             resp.context_menu(|ui| node_menu(ui, t, st, i, acts));
         }
     });
